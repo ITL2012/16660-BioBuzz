@@ -5,6 +5,7 @@ import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode
 import com.qualcomm.robotcore.eventloop.opmode.TeleOp
 import dev.nextftc.hardware.actuators.NextMotor
 import org.firstinspires.ftc.teamcode.roadrunner.MecanumDrive
+import org.firstinspires.ftc.teamcode.ControlFrame
 import org.firstinspires.ftc.teamcode.vision.VisionSubsystem
 import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor
 import kotlin.math.abs
@@ -74,6 +75,11 @@ class BioBuzzTeleOp : LinearOpMode() {
     private var escapeStartPose: Pose2d? = null
     private var pinTimerNanos: Long = 0
     private var lastEscapeNanos: Long = 0
+
+    // ===== DRIVE SCHEME TOGGLE =====
+    // Y button swaps between main (vision-assist) driving and JJ raw-stick driving.
+    private var useJjDrive = false
+    private var lastJjToggleBtn = false
 
     override fun runOpMode() {
         // ---- BOOT HARDWARE PROBE: degrade gracefully if anything's missing ----
@@ -170,10 +176,7 @@ class BioBuzzTeleOp : LinearOpMode() {
         BlackBox.event("match_start", "alliance" to SELECTED_TEAM.name)
 
         while (opModeIsActive()) {
-            // NextFTC motors only physically update when this event loop is
-            // polled; NextOpMode would do it, but this OpMode is a plain
-            // LinearOpMode, so it must be done here every cycle.
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             // ---- driver input ----
             var forward = (-gamepad1.left_stick_y).toDouble()
             var strafe = gamepad1.left_stick_x.toDouble()
@@ -185,6 +188,15 @@ class BioBuzzTeleOp : LinearOpMode() {
             if (gamepad1.right_stick_button && !lastRightStickBtn) poseHold = !poseHold
             lastLeftStickBtn = gamepad1.left_stick_button
             lastRightStickBtn = gamepad1.right_stick_button
+
+            // Drive scheme toggle: Y swaps between main (vision-assist) and JJ (raw stick) driving
+            if (gamepad1.y && !lastJjToggleBtn) useJjDrive = !useJjDrive
+            lastJjToggleBtn = gamepad1.y
+
+            // Raw stick snapshot for JJ scheme (bypasses all drive assists)
+            val jjForward = forward
+            val jjStrafe = strafe
+            val jjTurn = turn
 
             if (fieldCentric && locator != null) {
                 // Rotate the driver's WORLD-frame stick intent into the robot
@@ -198,6 +210,8 @@ class BioBuzzTeleOp : LinearOpMode() {
             }
 
             // ---- latest hive measurement (vision-dependent; null in manual-only) ----
+            // Lazy AprilTag: only enable when driver requests align assist (RB)
+            hive?.aprilTagEnabled = gamepad1.right_bumper
             val target = hive?.update()
             tagOverlay?.publish(target)
 
@@ -228,7 +242,7 @@ class BioBuzzTeleOp : LinearOpMode() {
             if (flywheel.anyMotor) {
                 when {
                     manualFire || assistFire -> flywheel.spinToRpm(shootingRpm)
-                    FLYWHEEL_PRIME_ENABLED -> flywheel.prime()
+                    FLYWHEEL_PRIME_ENABLED -> flywheel.ready()
                     else -> flywheel.stop()
                 }
             }
@@ -450,31 +464,35 @@ class BioBuzzTeleOp : LinearOpMode() {
                 }
             }
 
-            // ---- drive (always works — that's the point of the fallback) ----
-            // ---- POSE HOLD: sticks released -> hold the last still pose ----
-            if (locator != null && poseHold) {
-                val idleInput = abs(forward) < TELEOP_INPUT_DEADZONE &&
-                    abs(strafe) < TELEOP_INPUT_DEADZONE &&
-                    abs(turn) < TELEOP_INPUT_DEADZONE
-                if (idleInput) {
-                    if (stillPose == null) stillPose = locator.pose
-                    // Body-frame twist back to the still pose (+x fwd, +y left, +angle CCW)
-                    val err = stillPose!!.minus(locator.pose)
-                    val hf = (TELEOP_HOLD_POSITION_KP * err.line.x)
-                        .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
-                    val hs = (TELEOP_HOLD_POSITION_KP * err.line.y)
-                        .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
-                    val ht = (TELEOP_HOLD_HEADING_KP * Math.toDegrees(err.angle))
-                        .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
-                    forward = (forward + hf).coerceIn(-1.0, 1.0)
-                    strafe = (strafe + hs).coerceIn(-1.0, 1.0)
-                    turn = (turn + ht).coerceIn(-1.0, 1.0)
-                } else {
-                    stillPose = null
+            // ---- drive ----
+            if (useJjDrive) {
+                // JJ driving scheme: raw stick -> driveTeleOp, no assists
+                drivetrain?.driveTeleOp(jjForward, jjStrafe, jjTurn)
+            } else {
+                // ---- POSE HOLD: sticks released -> hold the last still pose ----
+                if (locator != null && poseHold) {
+                    val idleInput = abs(forward) < TELEOP_INPUT_DEADZONE &&
+                        abs(strafe) < TELEOP_INPUT_DEADZONE &&
+                        abs(turn) < TELEOP_INPUT_DEADZONE
+                    if (idleInput) {
+                        if (stillPose == null) stillPose = locator.pose
+                        // Body-frame twist back to the still pose (+x fwd, +y left, +angle CCW)
+                        val err = stillPose!!.minus(locator.pose)
+                        val hf = (TELEOP_HOLD_POSITION_KP * err.line.x)
+                            .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
+                        val hs = (TELEOP_HOLD_POSITION_KP * err.line.y)
+                            .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
+                        val ht = (TELEOP_HOLD_HEADING_KP * Math.toDegrees(err.angle))
+                            .coerceIn(-TELEOP_HOLD_MAX_POWER, TELEOP_HOLD_MAX_POWER)
+                        forward = (forward + hf).coerceIn(-1.0, 1.0)
+                        strafe = (strafe + hs).coerceIn(-1.0, 1.0)
+                        turn = (turn + ht).coerceIn(-1.0, 1.0)
+                    } else {
+                        stillPose = null
+                    }
                 }
+                drivetrain?.driveTeleOp(forward, strafe, turn)
             }
-
-            drivetrain?.driveTeleOp(forward, strafe, turn)
             vision?.periodic()
 
             if (manualOnly) {
@@ -500,8 +518,8 @@ class BioBuzzTeleOp : LinearOpMode() {
             }
             if (now - lastLogNanos > (1e9 / BLACKBOX_STATE_LOG_HZ).toLong()) {
                 lastLogNanos = now
-                BlackBox.log(
-                    "record" to "teleop",
+                BlackBox.event(
+                    "teleop",
                     "fwd" to forward, "strafe" to strafe, "turn" to turn,
                     "a" to gamepad1.a, "b" to gamepad1.b,
                     "rb" to gamepad1.right_bumper, "lb" to gamepad1.left_bumper,
@@ -546,7 +564,8 @@ class BioBuzzTeleOp : LinearOpMode() {
             if (locator != null) {
                 telemetry.addData(
                     "Drive mode",
-                    "%s%s | LStkBtn toggles | RStkBtn hold %s".format(
+                    if (useJjDrive) "JJ (raw stick) | Y toggles"
+                    else "%s%s | LStkBtn toggles | RStkBtn hold %s | Y = JJ".format(
                         if (fieldCentric) "FIELD-CENTRIC" else "robot-centric",
                         if (poseHold && stillPose != null) " [HOLDING]" else "",
                         if (poseHold) "ON" else "OFF",
@@ -569,7 +588,7 @@ class BioBuzzTeleOp : LinearOpMode() {
         drivetrain?.flushMotors()
         intake.stop()
         flywheel.stop()
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll()
         vision?.close()
         BlackBox.stop()
     }
