@@ -125,6 +125,10 @@ class HiveScoring(
 
     private val upIntrinsics = VisionConfig.calibrationFor(cameraId).intrinsics
 
+    /** When false, update() returns null immediately without querying the AprilTagProcessor.
+     *  Set to true only during ALIGN phase (and INIT for alliance selection). */
+    var aprilTagEnabled = true
+
     /**
      * Latest hive target for the SELECTED ALLIANCE ([SELECTED_TEAM], picked
      * during INIT in both match OpModes) — best visible own-hive cluster, else
@@ -132,6 +136,7 @@ class HiveScoring(
      * the robot can never line up on (or fire into) the wrong hive.
      */
     fun update(): HiveTarget? {
+        if (!aprilTagEnabled) return null
         val team = SELECTED_TEAM
         val ourClusters = teamClusterNames(team)
         val ourIds = teamTagIds(team).toHashSet()

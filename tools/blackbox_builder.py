@@ -2,19 +2,19 @@
 """
 Black Box dataset builder — turns a recorded match into a computer-friendly dataset.
 
-The robot's Black Box (TeamCode/.../blackbox.kt) records every match
-as a session folder on the Robot Controller:
+The robot's Black Box (TeamCode/.../blackbox.kt) records every match as ONE
+SQLite file on the Robot Controller:
 
-    blackbox/<label>_<timestamp>/
-        state.jsonl          one JSON line per record (state, frames, events...)
-        frames/UP/*.jpg      subsampled UP-camera frames
-        frames/FRONT/*.jpg   subsampled FRONT-camera frames
+    blackbox/<label>_<timestamp>.db
 
-Copy that folder off the phone over USB (Android/data/<rc app>/files/blackbox/)
+The state, the world-model tracks, the planner decisions, the events and the
+camera frames (as BLOBs) all live in typed tables inside that file.
+
+Copy that file off the phone over USB (Android/data/<rc app>/files/blackbox/)
 and run this tool:
 
-    python3 blackbox_builder.py blackbox/teleop_1760000000000
-    python3 blackbox_builder.py SESSION_DIR --out my_dataset --copy-frames
+    python3 blackbox_builder.py blackbox/teleop_1760000000000.db
+    python3 blackbox_builder.py SESSION.db --out my_dataset --copy-frames
 
 Outputs (in --out, default <session>_dataset/):
     state.csv         one row per state/auto/teleop record (pose, RPMs, inputs...)
@@ -34,6 +34,8 @@ import os
 import shutil
 import sys
 
+import bbdb
+
 KNOWN_STATE_COLUMNS = [
     "record", "remainingSec", "poseXcm", "poseYcm", "headingRad", "ballsHeld",
     "action", "targetId", "flyL", "flyR", "batteryV", "tiltDeg",
@@ -43,33 +45,23 @@ KNOWN_STATE_COLUMNS = [
 ]
 
 
-def load_records(session_dir):
-    path = os.path.join(session_dir, "state.jsonl")
-    if not os.path.exists(path):
-        sys.exit("no state.jsonl in {} — is this a Black Box session?".format(session_dir))
-    records = []
-    with open(path) as f:
-        for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except ValueError:
-                print("! skipping malformed line {}".format(i + 1))
-    return records
+def load_records(session_db):
+    if not os.path.exists(session_db):
+        sys.exit("no session file: {} — is this a Black Box session?".format(session_db))
+    return bbdb.load(session_db)
 
 
 def split_records(records):
-    """Route lines into: state rows, events, frames. Frame lines are the ones
-    written by BlackBox.noteFrame(): {"frame": <camera>, "file": ..., ...}."""
+    """Route the records into: state rows, events, frames. The frame rows
+    carry the camera and the frame id; the JPEG itself stays in the
+    database until --copy-frames asks for it."""
     state, events, frames = [], [], []
     for r in records:
-        if "event" in r:
-            events.append(r)
-        elif "file" in r and "frame" in r:
+        if "frame" in r:
             frames.append(r)
-        elif r.get("record") in ("state", "auto", "teleop", "guard", "jam"):
+        elif "event" in r:
+            events.append(r)
+        elif r.get("record") in ("state", "wm", "auto", "teleop", "guard", "jam"):
             state.append(r)
     return state, events, frames
 
@@ -120,18 +112,15 @@ def build(args):
         w.writeheader()
         for r in frames:
             w.writerow({"t": r.get("t"), "camera": r.get("frame"),
-                        "file": r.get("file"), "captureNanos": r.get("captureNanos")})
+                        "file": "frame_{}".format(r.get("frame_id")),
+                        "captureNanos": r.get("tn")})
     if args.copy_frames:
+        dst = os.path.join(out, "frames")
+        os.makedirs(dst, exist_ok=True)
         for cam in sorted({r.get("frame") for r in frames}):
-            src = os.path.join(session_dir, "frames", str(cam))
-            if not os.path.isdir(src):
-                continue
-            dst = os.path.join(out, "frames")
-            os.makedirs(dst, exist_ok=True)
-            names = sorted(os.listdir(src))
-            for i, name in enumerate(names):
-                shutil.copy2(os.path.join(src, name),
-                             os.path.join(dst, "{}_{:06d}.jpg".format(cam, i)))
+            for i, (_t, jpeg) in enumerate(bbdb.frames(session_dir, cam)):
+                with open(os.path.join(dst, "{}_{:06d}.jpg".format(cam, i)), "wb") as fh:
+                    fh.write(jpeg)
 
     # ---- report.txt ----
     t0 = records[0]["t"] if records else 0
@@ -184,13 +173,13 @@ def build(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("session", help="Black Box session folder (contains state.jsonl)")
+    ap.add_argument("session", help="Black Box session file (a .db recorded on the robot)")
     ap.add_argument("--out", default=None, help="output dataset folder (default <session>_dataset)")
     ap.add_argument("--copy-frames", action="store_true",
                     help="also copy + rename frames into the dataset")
     args = ap.parse_args()
-    if not os.path.isdir(args.session):
-        sys.exit("not a folder: {}".format(args.session))
+    if not os.path.isfile(args.session):
+        sys.exit("not a session file: {}".format(args.session))
     build(args)
 
 

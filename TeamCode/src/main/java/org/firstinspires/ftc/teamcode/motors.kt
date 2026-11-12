@@ -242,6 +242,37 @@ class Intake(private val hasMotor: Boolean = true) : Mechanism {
 
     val available: Boolean get() = hasMotor
 
+    // Encoder tracking for multi-ball pickup confirmation
+    private var encoderAtPickupStart = 0L
+    var lastPickupEncoderDelta = 0L
+    private var pickupsSinceReset = 0
+
+    /** Captures the current encoder position as the baseline for the next pickup. */
+    fun markPickupStart() {
+        encoderAtPickupStart = Math.round(intakeMotor?.encoderPosition as? Double ?: 0.0).toLong()
+    }
+
+    /** Returns encoder ticks accumulated since markPickupStart(). */
+    fun encoderDeltaSincePickupStart(): Long {
+        val current = Math.round(intakeMotor?.encoderPosition as? Double ?: 0.0).toLong()
+        return current - encoderAtPickupStart
+    }
+
+    /** Confirms a pickup via encoder delta. Resets counter and returns true if delta exceeds threshold. */
+    fun confirmPickupByEncoder(minTicks: Long = 50): Boolean {
+        val delta = encoderDeltaSincePickupStart()
+        if (delta >= minTicks) {
+            pickupsSinceReset++
+            lastPickupEncoderDelta = delta
+            encoderAtPickupStart = Math.round(intakeMotor?.encoderPosition as? Double ?: 0.0).toLong() // reset baseline
+            return true
+        }
+        return false
+    }
+
+    /** Total confirmed pickups since last reset. */
+    val confirmedPickups: Int get() = pickupsSinceReset
+
     fun spinUp(speed: Double = 1.0) {
         // NOTE: full range -1..1 — reverse (gamepad B in teleop) is a real
         // reverse here; the old code clamped negatives to a stop.
@@ -360,7 +391,14 @@ class FlyWheel(
         spinToRpm(speed.coerceIn(-1.0, 1.0) * FLYWHEEL_MOTOR_MAX_RPM)
     }
 
-    /** Idles whichever wheels exist at [FLYWHEEL_PRIME_RPM] so a real shot is a short hop, not a long spin-up. */
+    /** Idles whichever wheels exist at [FLYWHEEL_READY_RPM] (2500 RPM) — instant spin-up
+ *  to any shooting speed, draws ~1.5A vs ~4A at 6000 RPM. Used as "always ready" state. */
+    fun ready() {
+        spinToRpm(FLYWHEEL_READY_RPM)
+    }
+
+    /** Legacy: idles at PRIME_RPM (2000 RPM) — kept for backward compatibility. */
+    @Deprecated("Use ready() instead", ReplaceWith("ready()"))
     fun prime() {
         spinToRpm(FLYWHEEL_PRIME_RPM)
     }

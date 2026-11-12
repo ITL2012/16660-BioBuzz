@@ -6,6 +6,7 @@ import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode
 import com.qualcomm.robotcore.eventloop.opmode.TeleOp
 import com.qualcomm.robotcore.hardware.DcMotorEx
 import dev.nextftc.hardware.actuators.NextMotor
+import org.firstinspires.ftc.teamcode.ControlFrame
 import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName
 import org.firstinspires.ftc.teamcode.vision.CameraId
 import org.firstinspires.ftc.teamcode.vision.VisionConfig
@@ -531,7 +532,7 @@ class FlywheelCalibration : LinearOpMode() {
         }
 
         while (opModeIsActive()) {
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             if (gamepad1.dpad_up && !lastDpadUp && stepIdx < rpmSteps.size - 1) {
                 stepIdx++; fineRpm = 0.0
             }
@@ -554,14 +555,14 @@ class FlywheelCalibration : LinearOpMode() {
             ) {
                 loader.stroke()
                 while (opModeIsActive() && loader.busy) {
-                    NextMotor.motorEventLoop.poll()
+                    ControlFrame.tick()
                     telemetry.addData("LOADER", "stroking...")
                     telemetry.update()
                 }
                 val detector = ShotDetector(flywheel)
                 detector.arm()
                 while (opModeIsActive() && detector.update() == ShotDetector.State.ARMED) {
-                    NextMotor.motorEventLoop.poll()
+                    ControlFrame.tick()
                     telemetry.addData(
                         "SHOT WATCH",
                         "%.0f RPM (need a %.0f RPM dip)".format(
@@ -605,7 +606,7 @@ class FlywheelCalibration : LinearOpMode() {
 
         flywheel.stop(breakMotor = true)
         loader.home()
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll()
         BlackBox.stop()
     }
 }
@@ -659,7 +660,7 @@ class DriveOnlyOpMode : LinearOpMode() {
         waitForStart()
 
         while (opModeIsActive()) {
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             val forward = -gamepad1.left_stick_y.toDouble()
             val strafe = gamepad1.left_stick_x.toDouble()
             val turn = gamepad1.right_stick_x.toDouble()
@@ -700,7 +701,7 @@ class DriveOnlyOpMode : LinearOpMode() {
         }
 
         drivetrain.driveTeleOp(0.0, 0.0, 0.0) // stop
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll()
     }
 }
 // ============================================================================
@@ -851,10 +852,10 @@ class Experiment : LinearOpMode() {
         drivetrain.driveAtAngle(60.0, 15.0) // 15 deg for 60 cm
         sleepPolling(5000)
         drivetrain.flushMotors()
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll()
 
         while (opModeIsActive()) { // main loop
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             // Use THIS OpMode's gamepad1: the old global `controller` captured
             // BlocksOpModeCompanion.gamepad1 at class-load time, which is only
             // ever populated by the Blocks runtime and never updates for a
@@ -891,10 +892,10 @@ class CustomTeleOp(
 private fun LinearOpMode.sleepPolling(ms: Long) {
     val end = System.currentTimeMillis() + ms
     while (System.currentTimeMillis() < end) {
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.tick()
         sleep(10)
     }
-    NextMotor.motorEventLoop.poll()
+    ControlFrame.forcePoll()
 }
 
 /**
@@ -953,7 +954,7 @@ class DrivetrainSetupOpMode : LinearOpMode() {
 
         while (opModeIsActive()) {
             // Position/velocity moves through NextFTC need the event loop polled.
-            dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             val now = snapshot()
 
             // ---- A: 1-second spin test ----
@@ -987,11 +988,11 @@ class DrivetrainSetupOpMode : LinearOpMode() {
                 // Poll while waiting, or the position controller never moves the motors.
                 val crawlEnd = System.currentTimeMillis() + 4000
                 while (System.currentTimeMillis() < crawlEnd) {
-                    dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+                    ControlFrame.tick()
                     sleep(20)
                 }
                 drivetrain.flushMotors()
-                dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+                ControlFrame.forcePoll()
                 val after = snapshot()
                 telemetry.addData(
                     "50cm crawl",
@@ -1035,6 +1036,6 @@ class DrivetrainSetupOpMode : LinearOpMode() {
         }
 
         drivetrain.flushMotors()
-        dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll()
     }
 }

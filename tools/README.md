@@ -110,18 +110,20 @@ idle the flywheel stays primed at `FLYWHEEL_PRIME_RPM` so spin-up is quick.
 
 Every OpMode on the `feature/superhuman-autonomy` branch records a full-match
 Black Box session to the Robot Controller's storage (passive, onboard-only —
-see `docs/LEGALITY-REVIEW.md`): state lines (pose, vision, planner decisions,
-flywheel RPMs, battery, gamepad inputs), events, and subsampled JPEG frames
-from BOTH robot cameras.
+see `docs/LEGALITY-REVIEW.md`). A session is **ONE SQLite file**: the robot
+state (pose, flywheel RPMs, battery, gamepad inputs), the world-model tracks,
+the planner decisions, the events, and the subsampled JPEG frames from BOTH
+robot cameras (stored as BLOBs inside the file). Nothing is JSON any more, so
+nothing can be half-parsed.
 
 **Pull the data off the phone** over USB (MTP) from:
-`Android/data/org.firstinspires.ftc.robotcontroller/files/blackbox/<label>_<ts>/`
+`Android/data/org.firstinspires.ftc.robotcontroller/files/blackbox/<label>_<ts>.db`
 
 **Build the dataset** (pure standard library — no installs):
 
 ```bash
-python3 blackbox_builder.py ../blackbox/teleop_1760000000000
-python3 blackbox_builder.py SESSION_DIR --out my_match --copy-frames
+python3 blackbox_builder.py ../blackbox/teleop_1760000000000.db
+python3 blackbox_builder.py SESSION.db --out my_match --copy-frames
 ```
 
 Outputs `state.csv`, `events.csv`, `frames.csv`, `report.txt` (duration,

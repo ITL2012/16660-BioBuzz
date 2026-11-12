@@ -79,3 +79,8 @@ lint/generated/
 lint/outputs/
 lint/tmp/
 # lint/reports/
+
+# Generated Black Box fixtures and Python caches
+blackbox_fixtures/
+__pycache__/
+*.pyc

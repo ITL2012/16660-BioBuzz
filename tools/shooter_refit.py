@@ -22,32 +22,18 @@ import argparse
 import json
 import math
 import os
+
+import bbdb
 import sys
 
 
 def iter_sessions(paths):
-    """Yields state.jsonl paths for session dirs (or parents full of them)."""
-    for p in paths:
-        if os.path.isfile(os.path.join(p, "state.jsonl")):
-            yield p
-        elif os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                sub = os.path.join(p, name)
-                if os.path.isfile(os.path.join(sub, "state.jsonl")):
-                    yield sub
+    """Yields session database paths (or parents full of them)."""
+    return bbdb.iter_sessions(paths)
 
 
 def load(path):
-    out = []
-    with open(os.path.join(path, "state.jsonl")) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    pass
-    return out
+    return bbdb.load(path)
 
 
 def extract_shots(records):

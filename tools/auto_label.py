@@ -20,6 +20,8 @@ Usage:
 
 import argparse
 import os
+
+import bbdb
 import random
 import shutil
 import sys
@@ -86,24 +88,12 @@ def main():
     empty_seen = 0
     total = 0
 
-    for p in args.sessions:
-        session = None
-        candidates = []
-        if os.path.isdir(os.path.join(p, "frames", "FRONT")):
-            candidates.append(p)
-        elif os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                sub = os.path.join(p, name)
-                if os.path.isdir(os.path.join(sub, "frames", "FRONT")):
-                    candidates.append(sub)
-        for session in candidates:
-            for fname in sorted(os.listdir(os.path.join(session, "frames", "FRONT"))):
+    for session in bbdb.iter_sessions(args.sessions):
+            for frame_id, jpeg in bbdb.frames(session, "FRONT"):
                 if total >= args.max_frames:
                     break
-                if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                    continue
                 total += 1
-                img = cv2.imread(os.path.join(session, "frames", "FRONT", fname))
+                img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     continue
                 h_px, w_px = img.shape[:2]
@@ -113,11 +103,9 @@ def main():
                     if empty_seen % args.background_every != 0:
                         continue
                 split = "train" if rng.random() < args.split else "val"
-                stem = "{}_{}".format(os.path.basename(session)[:24], os.path.splitext(fname)[0])
-                shutil.copy2(
-                    os.path.join(session, "frames", "FRONT", fname),
-                    os.path.join(args.out, "images", split, stem + ".jpg"),
-                )
+                stem = "{}_{:06d}".format(os.path.basename(session)[:24], frame_id)
+                with open(os.path.join(args.out, "images", split, stem + ".jpg"), "wb") as f:
+                    f.write(jpeg)
                 lines = []
                 for cls, boxes in dets.items():
                     for (x, y, w, h) in boxes:

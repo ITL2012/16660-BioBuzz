@@ -230,6 +230,12 @@ object VisionTuning {
     // sags, raise this to 2 (~15 Hz) — tracking tolerates it, it just
     // reacquires more often.
     const val PROCESS_EVERY_NTH_FRAME = 1
+    const val ADAPTIVE_FRAME_DECIMATION = true     // enable adaptive frame rate
+    const val ADAPTIVE_DECIMATION_HIGH_CONF = 1   // process every frame when confidence high
+    const val ADAPTIVE_DECIMATION_MED_CONF = 2    // process every 2nd frame when confidence medium
+    const val ADAPTIVE_DECIMATION_LOW_CONF = 3    // process every 3rd frame when confidence low
+    const val ADAPTIVE_HIGH_CONF_THRESHOLD = 0.7  // above this = high confidence
+    const val ADAPTIVE_LOW_CONF_THRESHOLD = 0.35  // below this = low confidence
     const val DEBUG_OVERLAY = true            // draw tracked features / RANSAC classes
 
     // ---------- Self-building world map (start-pose anchored, reference only) ----------

@@ -375,10 +375,6 @@ class VisionSubsystem(
     val upProcessor = VisionCameraProcessor(CameraId.UP)
     val frontProcessor = VisionCameraProcessor(CameraId.FRONT)
 
-    // Frame grabbers (one per camera) — optional, controlled by FRAME_CAPTURE_ENABLED
-    val upFrameGrabber = FrameGrabProcessor("up_camera")
-    val frontFrameGrabber = FrameGrabProcessor("front_camera")
-
     /** The two cameras are two observation sources for ONE pose estimate. */
     val fusion = HybridPoseEstimator(upProcessor, frontProcessor)
 
@@ -416,7 +412,7 @@ class VisionSubsystem(
                 .setCamera(hardwareMap.get(WebcamName::class.java, UP_CAM_NAME))
                 .setCameraResolution(Size(VisionTuning.UP_CAM_WIDTH, VisionTuning.UP_CAM_HEIGHT))
                 .setLiveViewContainerId(portalViewIds[0])
-                .addProcessors(upProcessor, upFrameGrabber, *extraUpProcessors.toTypedArray())
+                .addProcessors(upProcessor, *extraUpProcessors.toTypedArray())
                 .build()
         } else {
             null
@@ -430,7 +426,6 @@ class VisionSubsystem(
                 .setLiveViewContainerId(portalViewIds[1])
                 .addProcessors(
                     frontProcessor,
-                    frontFrameGrabber,
                     *extraFrontProcessors.toTypedArray(),
                     // Single-camera mode: the surviving front camera also
                     // carries the UP camera's processors (AprilTags, overlays).

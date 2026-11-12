@@ -1,5 +1,6 @@
 apply plugin: 'com.android.application'
 apply plugin: 'kotlin-android'
+apply plugin: 'kotlinx-serialization'
 
 //
 // build.gradle in TeamCode
@@ -26,6 +27,14 @@ android {
 
     packagingOptions {
         jniLibs.useLegacyPackaging true
+    }
+
+    testOptions {
+        // The JVM unit tests run against android.jar's STUB classes, where
+        // every method throws "not mocked". The SQLite JDBC driver logs
+        // through SLF4J, which routes to android.util.Log — so without this
+        // every DB call dies on Log.isLoggable before it reaches SQLite.
+        unitTests.returnDefaultValues = true
     }
 }
 repositories {
@@ -55,7 +64,32 @@ dependencies {
     implementation "com.acmerobotics.roadrunner:actions:1.0.1"
     implementation "com.acmerobotics.dashboard:dashboard:0.5.1"
 
+    // BlackBox Binary: async Protobuf writer
+    implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3"
+    implementation "org.jetbrains.kotlinx:kotlinx-serialization-protobuf:1.6.3"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0"
+
+    // Recommended external libraries:
+    // - EJML: Efficient Java Matrix Library for EKF sensor fusion
+    implementation "org.ejml:ejml-simple:0.41"
+    // - Apache Commons Math: for RRT* math utilities, optimization
+    implementation "org.apache.commons:commons-math3:3.6.1"
+    // - Typesafe Config (HOCON): versioned, type-safe configuration
+    implementation "com.typesafe:config:1.4.3"
+    // - OjAlgo: linear algebra + QP solver for LQR/MPC
+    implementation "org.ojalgo:ojalgo:53.0.0"
+    // - Protobuf Java (for custom binary serialization if needed)
+    implementation "com.google.protobuf:protobuf-java:3.25.2"
+
     // JVM unit tests for the pure autonomy math (WorldModel, PhaseClock, DeadWheelMath)
     testImplementation 'junit:junit:4.13.2'
 }
 
+
+dependencies {
+    // SQLite JDBC for the desktop side of the Black Box. The Robot
+    // Controller writes the very same .db files with Android's own SQLite,
+    // so a session recorded on the robot opens unchanged on a computer —
+    // and Python's stdlib sqlite3 can read it with no extra dependency.
+    testImplementation "org.xerial:sqlite-jdbc:3.54.1.0"
+}

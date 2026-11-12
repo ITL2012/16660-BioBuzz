@@ -66,11 +66,18 @@ class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor {
     override fun processFrame(frame: Mat?, captureTimeNanos: Long): Any? {
         val img = frame ?: return null
 
-        // Bounded processing: process only every Nth frame.
+        // Adaptive frame decimation: vary processing rate based on confidence
         frameCounter++
-        if (VisionTuning.PROCESS_EVERY_NTH_FRAME > 1 &&
-            frameCounter % VisionTuning.PROCESS_EVERY_NTH_FRAME != 0
-        ) {
+        val decimation = if (VisionTuning.ADAPTIVE_FRAME_DECIMATION && confidenceEma > 0.0) {
+            when {
+                confidenceEma >= VisionTuning.ADAPTIVE_HIGH_CONF_THRESHOLD -> VisionTuning.ADAPTIVE_DECIMATION_HIGH_CONF
+                confidenceEma <= VisionTuning.ADAPTIVE_LOW_CONF_THRESHOLD -> VisionTuning.ADAPTIVE_DECIMATION_LOW_CONF
+                else -> VisionTuning.ADAPTIVE_DECIMATION_MED_CONF
+            }
+        } else {
+            VisionTuning.PROCESS_EVERY_NTH_FRAME
+        }
+        if (decimation > 1 && frameCounter % decimation != 0) {
             return latest.get()
         }
 

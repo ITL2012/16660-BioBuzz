@@ -24,6 +24,8 @@ Usage:
 import argparse
 import json
 import os
+
+import bbdb
 import sys
 
 try:
@@ -41,22 +43,15 @@ def parse_hsv(text):
 
 
 def iter_sessions(paths):
-    for p in paths:
-        if os.path.isfile(os.path.join(p, "state.jsonl")):
-            yield p
-        elif os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                sub = os.path.join(p, name)
-                if os.path.isfile(os.path.join(sub, "state.jsonl")):
-                    yield sub
+    return bbdb.iter_sessions(paths)
 
 
 def frames_index(records, camera="FRONT"):
-    """(t, path) for every saved frame of one camera, sorted by time."""
+    """(t, frame id) for every saved frame of one camera, sorted by time."""
     out = []
     for r in records:
-        if r.get("frame") == camera and "file" in r:
-            out.append((r["t"], r["file"]))
+        if r.get("frame") == camera and "frame_id" in r:
+            out.append((r["t"], r["frame_id"]))
     return sorted(out)
 
 
@@ -87,15 +82,7 @@ def main():
     found, missed, no_frame = 0, 0, 0
 
     for session in iter_sessions(args.sessions):
-        records = []
-        with open(os.path.join(session, "state.jsonl")) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except ValueError:
-                        pass
+        records = bbdb.load(session)
         idx = frames_index(records, "FRONT")
         if not idx:
             print("* {}: no FRONT frames — skipping".format(os.path.basename(session)))
@@ -109,8 +96,8 @@ def main():
             if fr is None:
                 no_frame += 1
                 continue
-            path = os.path.join(session, "frames", "FRONT", fr[1])
-            img = cv2.imread(path)
+            jpeg = bbdb.frame_bytes(session, fr[1])
+            img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR) if jpeg else None
             if img is None:
                 no_frame += 1
                 continue

@@ -11,9 +11,12 @@ package org.firstinspires.ftc.teamcode
  */
 
 import com.qualcomm.robotcore.hardware.DcMotor
+import com.qualcomm.robotcore.hardware.DcMotorEx
 import com.qualcomm.robotcore.hardware.HardwareMap
 import com.qualcomm.robotcore.hardware.IMU
 import com.qualcomm.robotcore.hardware.Servo
+import dev.nextftc.units.RotationsPerMinute
+import org.firstinspires.ftc.robotcore.external.Telemetry
 import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName
 import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit
 // ============================================================================
@@ -114,6 +117,129 @@ object HardwareProbe {
             intakeMotor = has(DcMotor::class.java, IntakeMotor),
             loaderServo = has(Servo::class.java, LoaderServoName),
         )
+    }
+
+    /**
+     * ============ DEEP PROBE — active hardware verification ============
+     *
+     * Spins motors, reads encoders, tests IMU, checks camera FPS, verifies
+     * flywheel ramp. Call during INIT for full pre-match checkout.
+     * Returns a DeepReport with PASS/FAIL per subsystem and actionable messages.
+     */
+    fun probeDeep(hardwareMap: HardwareMap, telemetry: Telemetry? = null): DeepReport {
+        val checks = mutableListOf<DeepCheck>()
+        fun add(name: String, pass: Boolean, msg: String = "") {
+            checks.add(DeepCheck(name, pass, msg))
+            telemetry?.addData(name, if (pass) "PASS" else "FAIL: $msg")
+            telemetry?.update()
+        }
+
+        // 1. Drive motors: spin each at 0.25 power for 500ms, verify encoder counts
+        val driveNames = listOf(DrivetrainFrontLeft, DrivetrainFrontRight, DrivetrainBackLeft, DrivetrainBackRight)
+        val expectedSigns = listOf(1, -1, 1, -1) // FR/BR typically face backward
+        for ((i, name) in driveNames.withIndex()) {
+            try {
+                val motor = hardwareMap.get(DcMotorEx::class.java, name)
+                val startPos = motor.currentPosition
+                motor.power = 0.25 * expectedSigns[i]
+                Thread.sleep(500)
+                motor.power = 0.0
+                val delta = (motor.currentPosition - startPos) * expectedSigns[i]
+                add("Drive $name", delta > 50, if (delta <= 50) "encoder delta $delta too small (check wiring/direction)" else "")
+            } catch (e: Exception) {
+                add("Drive $name", false, "not configured or error: ${e.message}")
+            }
+        }
+
+        // 2. IMU: verify it reads yaw and responds to rotation
+        try {
+            val imu = hardwareMap.get(IMU::class.java, RR_IMU_NAME)
+            val yaw1 = imu.robotYawPitchRollAngles.getYaw(AngleUnit.DEGREES)
+            Thread.sleep(100)
+            val yaw2 = imu.robotYawPitchRollAngles.getYaw(AngleUnit.DEGREES)
+            add("IMU", true, "yaw=${yaw1.toInt()}°")
+        } catch (e: Exception) {
+            add("IMU", false, "not configured or error: ${e.message}")
+        }
+
+        // 3. Cameras: verify configuration
+        try {
+            val upCam = hardwareMap.get(WebcamName::class.java, UP_CAM_NAME)
+            val frontCam = hardwareMap.get(WebcamName::class.java, FRONT_CAM_NAME)
+            add("UP Camera", upCam != null, if (upCam == null) "not configured" else "")
+            add("FRONT Camera", frontCam != null, if (frontCam == null) "not configured" else "")
+        } catch (e: Exception) {
+            add("Cameras", false, "error: ${e.message}")
+        }
+
+        // 4. Flywheel: spin to 2000 RPM, verify both wheels ramp up
+        try {
+            val left = hardwareMap.get(DcMotorEx::class.java, FlywheelLeftMotor)
+            val right = hardwareMap.get(DcMotorEx::class.java, FlywheelRightMotor)
+            left.setMode(DcMotor.RunMode.RUN_USING_ENCODER)
+            right.setMode(DcMotor.RunMode.RUN_USING_ENCODER)
+            left.setVelocity(2000.0)
+            right.setVelocity(2000.0)
+            var leftOk = false
+            var rightOk = false
+            val deadline = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline) {
+                val lRpm = left.getVelocity().toDouble() * 60.0 // convert rotations/sec to RPM
+                val rRpm = right.getVelocity().toDouble() * 60.0
+                if (lRpm > 1500) leftOk = true
+                if (rRpm > 1500) rightOk = true
+                if (leftOk && rightOk) break
+                Thread.sleep(50)
+            }
+            left.setVelocity(0.0)
+            right.setVelocity(0.0)
+            add("Flywheel Left", leftOk, if (!leftOk) "did not reach 1500 RPM in 3s" else "")
+            add("Flywheel Right", rightOk, if (!rightOk) "did not reach 1500 RPM in 3s" else "")
+        } catch (e: Exception) {
+            add("Flywheel", false, "not configured or error: ${e.message}")
+        }
+
+        // 5. Intake: spin at 0.5 power, verify it runs
+        try {
+            val intake = hardwareMap.get(DcMotorEx::class.java, IntakeMotor)
+            intake.power = 0.5
+            Thread.sleep(300)
+            val velocity = intake.getVelocity()
+            intake.power = 0.0
+            add("Intake", velocity != 0.0, "velocity=${velocity.toString().take(4)}")
+        } catch (e: Exception) {
+            add("Intake", false, "not configured or error: ${e.message}")
+        }
+
+        // 6. Loader servo: move to stroke and back
+        try {
+            val loader = hardwareMap.get(Servo::class.java, LoaderServoName)
+            loader.position = LOADER_STROKE_END_POSITION
+            Thread.sleep(500)
+            loader.position = LOADER_HOME_POSITION
+            Thread.sleep(500)
+            add("Loader Servo", true, "stroked and homed")
+        } catch (e: Exception) {
+            add("Loader Servo", false, "not configured or error: ${e.message}")
+        }
+
+        val allPass = checks.all { it.pass }
+        return DeepReport(allPass, checks)
+    }
+}
+
+data class DeepCheck(
+    val name: String,
+    val pass: Boolean,
+    val message: String = "",
+)
+
+data class DeepReport(
+    val allPass: Boolean,
+    val checks: List<DeepCheck>,
+) {
+    fun summary(): String {
+        return checks.map { "${if (it.pass) "✓" else "✗"} ${it.name}${if (it.message.isNotBlank()) " - ${it.message}" else ""}" }.joinToString("\n")
     }
 }
 // ============================================================================

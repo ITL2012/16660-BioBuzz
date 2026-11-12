@@ -25,7 +25,7 @@ conservative form available.
 
 | Feature | What it does | Rule area (VERIFY in BioBuzz GM1) | Assessment |
 |---|---|---|---|
-| Black Box state log | Writes JSON lines to the Robot Controller's own storage | Robot Rules: permitted devices / ROBOT Controller | Very safe. Logging to the RC phone's storage is not a "device"; nothing transmits |
+| Black Box state log | Writes ONE SQLite file (state, tracks, decisions, events, camera frames) to the Robot Controller's own storage | Robot Rules: permitted devices / ROBOT Controller | Very safe. Logging to the RC phone's storage is not a "device"; nothing transmits |
 | Black Box frame capture | Saves subsampled JPEGs from the two USB webcams already attached to the RC | Robot Rules: cameras must connect to the Robot Controller; past manuals allow onboard cameras and video recording, and prohibit using video to communicate with the drive team mid-match | Safe as built: cameras are RC-attached (already true for the vision stack), recording stays onboard, nothing is viewed until after the match. Check the camera/recording rule in BioBuzz GM1 says the same |
 | Shadow-mode planner | Pure logging of what the planner WOULD do during human teleop | none — no robot behavior changes | Safe. It's telemetry |
 | WorldModel + StrategicPlanner | Onboard software decisions | Game Rules: driver-controlled period | Onboard autonomy during teleop has never been prohibited — rules require the ROBOT to be controlled through the Driver Station and to stop when commanded, not that a human move every stick. The deadman (below) keeps a human in the loop at all times |

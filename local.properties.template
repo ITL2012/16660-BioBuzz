@@ -1,0 +1,35 @@
+# BioBuzz Robotics - Local Properties Template
+# ============================================================
+# COPY THIS FILE TO local.properties AND EDIT THE sdk.dir PATH
+# ============================================================
+# This file is NOT committed to git (in .gitignore)
+# Each developer/machine needs their own local.properties
+# ============================================================
+
+# --- Android SDK Location (REQUIRED) ---
+# macOS (Android Studio default):
+sdk.dir=/Users/YOUR_USERNAME/Library/Android/sdk
+
+# Linux (Android Studio default):
+# sdk.dir=/home/YOUR_USERNAME/Android/Sdk
+
+# Windows (Android Studio default - note double backslashes):
+# sdk.dir=C\\:\\Users\\YOUR_USERNAME\\AppData\\Local\\Android\\Sdk
+
+# Custom Android SDK location:
+# sdk.dir=/opt/android-sdk
+
+# --- Optional: NDK Version (if using native code) ---
+# ndk.dir=/Users/YOUR_USERNAME/Library/Android/sdk/ndk/21.3.6528147
+
+# --- Optional: Custom Gradle Properties ---
+# org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+# org.gradle.parallel=true
+# org.gradle.configureondemand=true
+
+# ============================================================
+# SETUP INSTRUCTIONS:
+# 1. cp local.properties.template local.properties
+# 2. Edit sdk.dir to match YOUR Android SDK installation
+# 3. Run ./gradlew :TeamCode:assembleDebug to verify
+# ============================================================

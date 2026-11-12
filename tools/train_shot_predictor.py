@@ -18,6 +18,8 @@ import argparse
 import json
 import math
 import os
+
+import bbdb
 import random
 import sys
 
@@ -28,14 +30,7 @@ except ImportError:
 
 
 def iter_sessions(paths):
-    for p in paths:
-        if os.path.isfile(os.path.join(p, "state.jsonl")):
-            yield p
-        elif os.path.isdir(p):
-            for name in sorted(os.listdir(p)):
-                sub = os.path.join(p, name)
-                if os.path.isfile(os.path.join(sub, "state.jsonl")):
-                    yield sub
+    return bbdb.iter_sessions(paths)
 
 
 def extract_samples(records):
@@ -74,8 +69,7 @@ def main():
 
     samples = []
     for session in iter_sessions(args.sessions):
-        with open(os.path.join(session, "state.jsonl")) as f:
-            records = [json.loads(line) for line in f if line.strip()]
+        records = bbdb.load(session)
         got = extract_samples(records)
         print("* {}: {} usable shots".format(os.path.basename(session), len(got)))
         samples.extend(got)

@@ -7,6 +7,7 @@ import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode
 import com.qualcomm.robotcore.eventloop.opmode.TeleOp
 import dev.nextftc.hardware.actuators.NextMotor
 import org.firstinspires.ftc.teamcode.vision.VisionSubsystem
+import org.firstinspires.ftc.teamcode.ControlFrame
 import org.firstinspires.ftc.teamcode.vision.VisionTuning
 import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor
 import kotlin.math.PI
@@ -18,7 +19,7 @@ import kotlin.math.sin
  * ============ BIOBUZZ SELF-PLAY TELEOP — the robot drives itself ============
  *
  * The full superhuman stack runs the driver-controlled period end to end:
- * WorldModel (field memory) + StrategicPlanner (lookahead + endgame) +
+ * WorldModel (field memory) + MCTSPlanner (Monte Carlo lookahead + endgame) +
  * distance-based shooter + reflexes. The HUMAN is demoted to supervisor:
  *
  *   * HOLD LEFT TRIGGER = the deadman. Release it and the robot stops.
@@ -42,7 +43,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
     private lateinit var intake: Intake
     private lateinit var flywheel: FlyWheel
     private val world = WorldModel()
-    private val planner = StrategicPlanner()
+    private val planner = MCTSPlanner(playouts = 32, maxDepth = 3) // fewer playouts for 2Hz teleop
+    private val shadowDashboard = ShadowPlannerDashboard()
     private var jamGuard: IntakeJamGuard? = null
     private var tiltGuard: TiltGuard? = null
 
@@ -163,7 +165,7 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
 
         try {
             while (opModeIsActive()) {
-                NextMotor.motorEventLoop.poll()
+                ControlFrame.tick()
                 val elapsed = runtime - clockStartRuntime
                 val remaining = (MATCH_TELEOP_SECONDS - elapsed).coerceAtLeast(0.0)
                 val now = System.nanoTime()
@@ -201,6 +203,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                     lastDecision = d
                     lastDecisionNanos = now
                 }
+                // ---- Shadow Planner Dashboard (live FTC Dashboard stream) ----
+                shadowDashboard.update(world, ballsHeld, remaining, px, py, lastDecision, planner)
                 val decision = lastDecision ?: PlannerDecision(
                     PlannerAction.HOLD, -1, "", 0.0, 0.0, 0.0, 0.0, "starting",
                 )
@@ -219,8 +223,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                     if (loader.available) loader.home()
                     shotDetector.idle()
                     fireState = FireState.IDLE
-                    BlackBox.log(
-                        "record" to "guard", "deadman" to deadman, "tipping" to tipping,
+                    BlackBox.event(
+                        "guard", "deadman" to deadman, "tipping" to tipping,
                         "tiltDeg" to (tiltGuard?.tiltDeg() ?: 0.0),
                     )
                     telemetry.addData(
@@ -236,8 +240,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                 // ---- black box state @ BLACKBOX_STATE_LOG_HZ ----
                 if (now - lastStateLogNanos > (1e9 / BLACKBOX_STATE_LOG_HZ).toLong()) {
                     lastStateLogNanos = now
-                    BlackBox.log(
-                        "record" to "state",
+                    BlackBox.event(
+                        "state",
                         "remainingSec" to remaining,
                         "poseXcm" to px, "poseYcm" to py, "headingRad" to h,
                         "ballsHeld" to ballsHeld,
@@ -265,7 +269,7 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
             drive.setDrivePowers(PoseVelocity2d(Vector2d(0.0, 0.0), 0.0))
             intake.stop()
             flywheel.stop()
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.forcePoll()
             vision.close()
             BlackBox.stop()
         }
@@ -293,7 +297,7 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
 
                 val jam = jamGuard?.update(spinning = true)
                 if (jam == IntakeJamGuard.State.JAMMED) {
-                    BlackBox.log("record" to "jam", "state" to "JAMMED")
+                    BlackBox.event("jam", "state" to "JAMMED")
                     // give the pickup a rest: stop intake until the guard resets
                 }
 
@@ -386,7 +390,7 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                 // update(false) idles the intake and resets a jammed guard
                 jamGuard?.update(spinning = false)
                 intake.stop()
-                if (d.action == PlannerAction.PARK) flywheel.stop() else flywheel.prime()
+                if (d.action == PlannerAction.PARK) flywheel.stop() else flywheel.ready()
             }
         }
 

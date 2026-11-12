@@ -167,8 +167,8 @@ object ShotPredictor {
         val now = System.nanoTime()
         if (now - lastLogNanos > 1_000_000_000L) {
             lastLogNanos = now
-            BlackBox.log(
-                "record" to "nn_shot",
+            BlackBox.event(
+                "nn_shot",
                 "p" to p, "rpm" to rpm, "distanceCm" to distanceCm,
                 "batteryV" to batteryVolts(), "source" to source,
             )
@@ -235,14 +235,15 @@ object NeuralReferee {
     fun publish(dets: List<Detection>, captureNanos: Long) {
         latestList = dets
         latestNanos = captureNanos
-        BlackBox.log(
-            "record" to "nn_det",
-            "count" to dets.size,
-            "det" to dets.map {
-                mapOf("cls" to it.label, "conf" to it.confidence,
-                      "x" to it.x, "y" to it.y, "w" to it.w, "h" to it.h)
-            },
-        )
+        // One event per detection: the rows are typed, so the training
+        // tools can filter on class and confidence with plain SQL.
+        for (d in dets) {
+            BlackBox.event(
+                "nn_det",
+                "cls" to d.label, "conf" to d.confidence,
+                "x" to d.x, "y" to d.y, "w" to d.w, "h" to d.h,
+            )
+        }
     }
 
     fun latest(): List<Detection> = latestList

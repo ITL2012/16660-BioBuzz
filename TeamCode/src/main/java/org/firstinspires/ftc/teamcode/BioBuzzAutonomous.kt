@@ -64,6 +64,26 @@ class BioBuzzAutonomous : LinearOpMode() {
     private lateinit var pickupSensor: PickupCurrentSensor
     private val world = WorldModel()
 
+    /**
+     * The match strategy: what the robot should be doing right now. Pure
+     * logic, so the endgame decisions are unit-tested on the JVM.
+     */
+    private val phasePolicy = PhasePolicy()
+
+    /** Balls currently in the hopper (feeds the dynamic fire reserve). */
+    private var ballsHeld = 0
+
+    /**
+     * True while the robot is lined up on the hive and ready to fire. Set by
+     * the ALIGN phase, cleared the moment the robot drives away (collecting
+     * or parking invalidates the alignment).
+     */
+    private var alignedForFire = false
+
+    /** Field half-extents in cm, used for the park reserve's wall distance. */
+    private val fieldHalfWidthCm = 180.0
+    private val fieldHalfHeightCm = 120.0
+
     override fun runOpMode() {
         // ---- boot-time hardware probe: no full autonomy kit -> stay parked ----
         val hw = HardwareProbe.probe(hardwareMap)
@@ -123,6 +143,8 @@ class BioBuzzAutonomous : LinearOpMode() {
         // ---- INIT: pick your alliance before the match starts ----
         // D-pad LEFT = RED, D-pad RIGHT = BLUE. HiveScoring only ever targets
         // the selected alliance's hives, so this must match the match sheet.
+        // Enable AprilTag for INIT so drivers can see hive tags on preview
+        hive.aprilTagEnabled = true
         while (!isStarted && !isStopRequested) {
             if (gamepad1.dpad_left) SELECTED_TEAM = TeamColor.RED
             else if (gamepad1.dpad_right) SELECTED_TEAM = TeamColor.BLUE
@@ -149,112 +171,231 @@ class BioBuzzAutonomous : LinearOpMode() {
             telemetry.update()
         }
 
-        clock = PhaseClock()
+        // Dynamic reserves: the clock holds back exactly what the endgame
+        // will cost from WHERE WE ARE RIGHT NOW — the run home to the hive,
+        // the spin-up, one feed stroke per ball we hold, and the park.
+        val reserveCalc = DynamicReserveCalculator(
+            robotPositionCm = {
+                if (::drive.isInitialized) drive.pose.position.x * 2.54 to drive.pose.position.y * 2.54
+                else null
+            },
+            hivePositionCm = { world.hive() },
+            ballsHeld = { ballsHeld },
+            distanceToWallCm = { distanceToNearestWallCm() },
+            // Once the robot is lined up, the alignment no longer needs to
+            // be reserved — only the drive home, the spin-up, the feeding
+            // and the park.
+            isAligned = { alignedForFire },
+        )
+        clock = PhaseClock(reserveCalculator = { reserveCalc.totalReserveSec() })
         pickupSensor = PickupCurrentSensor(intake)
 
         try {
-            // ---- THE SCORE LOOP: keep cycling while a full cycle fits ----
+            // ---- SMART FLYWHEEL PRE-SPIN: always keep wheels at READY_RPM so any shot is fast ----
+            // READY_RPM = 2500 (fast spin-up to any shooting speed, low current draw)
+            // Only goes to full shooting RPM when we have balls AND are approaching hive
+            flywheel.spinToRpm(FLYWHEEL_READY_RPM)
+            telemetry.addData("FLYWHEEL", "READY at %.0f RPM".format(FLYWHEEL_READY_RPM))
+            telemetry.update()
+
+            // ---- THE SCHEDULER-DRIVEN SCORE LOOP ----
+            //
+            // The old loop ran a fixed script (collect -> flower -> polish ->
+            // align -> fire) and could only stop at phase boundaries. The
+            // scheduler publishes every phase with a priority and lets the
+            // highest-priority one run; a phase that is running asks the
+            // scheduler, every iteration, whether it should yield. That is
+            // what makes "the hopper is full and the clock is running out —
+            // stop hunting and go score" take effect within a frame instead
+            // of after the next 9-second collect phase.
             var cycle = 0
             var totalScored = 0
+            var polishDone = false
+            // The match script order the team tuned: collect, pull a flower,
+            // then the one-time vision cleanup. The policy hands the next
+            // script phase the elevated priority.
+            var collectDoneThisCycle = false
+            var flowerDoneThisCycle = false
+            val scheduler = PhaseScheduler(clock)
+            ControlFrame.reset()
             while (opModeIsActive()) {
                 cycle++
-                NextMotor.motorEventLoop.poll()
+                ControlFrame.tick()
                 BlackBox.event("cycle_start", "cycle" to cycle, "remainingSec" to clock.remainingSec())
                 telemetry.addData("AUTO CYCLE", cycle)
                 telemetry.addData("Clock", "%.1fs left".format(clock.remainingSec()))
+                telemetry.addData("Reserves", "park+fire=%.1fs".format(clock.currentReserveSec()))
+                telemetry.addData("Phase", scheduler.current?.phase?.name ?: "-")
                 telemetry.update()
 
-                // ---- PHASE 1: COLLECT (planner-driven, memory-backed) ----
-                BlackBox.event("phase", "name" to "1-collect")
-                val collected = collectBalls(
-                    clock.deadlineNanos(
-                        AUTONOMOUS_COLLECT_TIMEOUT_MS,
-                        reserveSec = AUTONOMY_PARK_RESERVE_SEC + AUTONOMY_FIRE_RESERVE_SEC,
-                    )
-                )
-                BlackBox.event("collect_done", "balls" to collected)
-                telemetry.addData("PHASE 1 done", "$collected / $MAX_BALLS_HELD balls")
+                // ---- ask the scheduler which phase owns the robot now ----
+                val task = scheduler.next(
+                    phaseCandidates(scheduler, polishDone, collectDoneThisCycle, flowerDoneThisCycle),
+                ) ?: break
 
-                // ---- PHASE 1b: FLOWER (optional; needs capacity AND time) ----
-                if (FLOWER_PULL_ENABLED && collected < MAX_BALLS_HELD &&
-                    clock.fits(MIN_CYCLE_REMAINING_SEC + AUTONOMY_FIRE_RESERVE_SEC)
-                ) {
-                    telemetry.addLine("PHASE 1b: flower pull")
-                    BlackBox.event("phase", "name" to "1b-flower")
-                    useFlowerIfVisible(
-                        clock.deadlineNanos(
-                            FLOWER_PULL_TIMEOUT_MS,
-                            reserveSec = AUTONOMY_PARK_RESERVE_SEC + AUTONOMY_FIRE_RESERVE_SEC,
+                when (task.phase) {
+                    AutonomyPhase.COLLECT -> {
+                        // Lazy AprilTag: off during COLLECT to save CPU (~8ms/frame)
+                        hive.aprilTagEnabled = false
+                        // Driving away invalidates any previous alignment.
+                        alignedForFire = false
+                        BlackBox.event("phase", "name" to "1-collect")
+                        // Top the hopper up — never overwrite what we hold.
+                        ballsHeld = minOf(
+                            MAX_BALLS_HELD,
+                            ballsHeld + collectBalls(
+                                clock.deadlineNanos(
+                                    AUTONOMOUS_COLLECT_TIMEOUT_MS,
+                                    reserveSec = 0.0, // dynamic reserves
+                                ),
+                                alreadyHeld = ballsHeld,
+                            ) {
+                                shouldYield(
+                                    scheduler,
+                                    polishDone,
+                                    collectDoneThisCycle,
+                                    flowerDoneThisCycle,
+                                )
+                            },
                         )
-                    )
-                }
-
-                // ---- PHASE 2: POLISH (first cycle only — one-time cleanup) ----
-                if (cycle == 1) {
-                    telemetry.addLine("PHASE 2: vision-guidance polish")
-                    BlackBox.event("phase", "name" to "2-polish")
-                    runGuidance()
-                }
-
-                // ---- PHASE 3 + 4: ALIGN + FIRE (only with balls to shoot) ----
-                if (collected > 0) {
-                    telemetry.addLine("PHASE 3: hive alignment")
-                    BlackBox.event("phase", "name" to "3-align")
-                    flywheel.spinToRpm(
-                        hive.update()?.let { ShooterModel.rpmForDistance(it.distanceCm) }
-                            ?: FLYWHEEL_PRIME_RPM
-                    )
-                    val aligned = alignToHive(
-                        clock.deadlineNanos(
-                            HiveScoringConfig.ALIGN_TIMEOUT_MS,
-                            reserveSec = AUTONOMY_PARK_RESERVE_SEC + AUTONOMY_FIRE_RESERVE_SEC,
-                        )
-                    )
-
-                    if (aligned) {
-                        val fired = fireBalls(collected)
-                        totalScored += fired
-                        BlackBox.event(
-                            "cycle_done",
-                            "cycle" to cycle, "fired" to fired, "totalScored" to totalScored,
-                        )
-                    } else {
-                        BlackBox.event("fire_skipped", "reason" to "align failed")
-                        telemetry.addData("PHASE 4", "ALIGN FAILED - skipping fire (safe)")
-                        telemetry.update()
+                        collectDoneThisCycle = true
+                        BlackBox.event("collect_done", "balls" to ballsHeld)
+                        telemetry.addData("PHASE 1 done", "$ballsHeld / $MAX_BALLS_HELD balls")
                     }
-                    flywheel.stop()
-                } else if (!clock.fits(MIN_CYCLE_REMAINING_SEC)) {
-                    // Nothing collected and no time for another try: park.
-                    break
+
+                    AutonomyPhase.FLOWER -> {
+                        hive.aprilTagEnabled = false
+                        // Pulling a flower drives the robot off the hive
+                        // line, so any alignment is gone.
+                        alignedForFire = false
+                        telemetry.addLine("PHASE 1b: flower pull")
+                        BlackBox.event("phase", "name" to "1b-flower")
+                        val pulled = useFlowerIfVisible(
+                            clock.deadlineNanos(
+                                FLOWER_PULL_TIMEOUT_MS,
+                                reserveSec = 0.0, // dynamic reserves
+                            ),
+                        ) {
+                            shouldYield(
+                                scheduler,
+                                polishDone,
+                                collectDoneThisCycle,
+                                flowerDoneThisCycle,
+                            )
+                        }
+                        if (pulled) ballsHeld = minOf(MAX_BALLS_HELD, ballsHeld + 1)
+                        flowerDoneThisCycle = true
+                        BlackBox.event("flower_done", "pulled" to pulled, "balls" to ballsHeld)
+                    }
+
+                    AutonomyPhase.POLISH -> {
+                        // One-time vision-guidance cleanup. Not interruptible.
+                        // The guidance moves the robot, so any alignment is
+                        // gone afterwards.
+                        alignedForFire = false
+                        telemetry.addLine("PHASE 2: vision-guidance polish")
+                        BlackBox.event("phase", "name" to "2-polish")
+                        runGuidance()
+                        polishDone = true
+                    }
+
+                    AutonomyPhase.ALIGN -> {
+                        if (ballsHeld <= 0) {
+                            // Nothing to shoot — the task went stale. Skip
+                            // the phase, not the whole match.
+                            scheduler.complete()
+                            continue
+                        }
+                        // Spin up to shooting RPM for this specific distance
+                        val hivePos = hive.update()
+                        val distToHive = if (hivePos != null) hivePos.distanceCm else 100.0
+                        val shootingRpm = ShotPredictor.adjustRpm(
+                            ShooterModel.rpmForDistance(distToHive),
+                            distToHive,
+                            "auto_shoot"
+                        )
+                        flywheel.spinToRpm(shootingRpm)
+                        telemetry.addData("FLYWHEEL", "SPIN-UP to %.0f RPM (%.0f cm)".format(shootingRpm, distToHive))
+
+                        // Lazy AprilTag: enable for ALIGN phase
+                        hive.aprilTagEnabled = true
+                        telemetry.addLine("PHASE 3: hive alignment")
+                        BlackBox.event("phase", "name" to "3-align")
+
+                        // Desperation mode: force shot if time < 2 * scoreTime
+                        val scoreTime = distToHive / ROBOT_SPEED_CM_PER_SEC + PLANNER_SCORE_TOTAL_SEC
+                        val desperationMode = clock.remainingSec() < 2.0 * scoreTime
+                        // The alignment itself is inside the reserve, so the
+                        // deadline gives it the time left after the drive
+                        // home, the spin-up, the feeding and the park.
+                        val alignReserve =
+                            (clock.currentReserveSec() - ALIGN_ESTIMATE_SEC).coerceAtLeast(0.0)
+                        val aligned = alignToHive(
+                            clock.deadlineNanos(
+                                HiveScoringConfig.ALIGN_TIMEOUT_MS,
+                                reserveSec = alignReserve,
+                            ),
+                            desperationMode,
+                        ) {
+                            shouldYield(
+                                scheduler,
+                                polishDone,
+                                collectDoneThisCycle,
+                                flowerDoneThisCycle,
+                            )
+                        }
+
+                        alignedForFire = aligned
+                        if (aligned) {
+                            // FIRE has a higher priority, so the scheduler
+                            // picks it up on the very next turn.
+                            BlackBox.event("aligned", "ready" to true)
+                        } else {
+                            BlackBox.event("fire_skipped", "reason" to "align failed")
+                            telemetry.addData("PHASE 4", "ALIGN FAILED - skipping fire (safe)")
+                            telemetry.update()
+                        }
+                    }
+
+                    AutonomyPhase.FIRE -> {
+                        // Shoot what we hold. The ALIGN phase normally gets
+                        // us here (FIRE outranks ALIGN, so the scheduler
+                        // picks it up immediately afterwards).
+                        if (ballsHeld <= 0) {
+                            scheduler.complete()
+                            continue
+                        }
+                        BlackBox.event("phase", "name" to "4-fire")
+                        val fired = fireBalls(ballsHeld)
+                        ballsHeld -= fired
+                        alignedForFire = false
+                        totalScored += fired
+                        // A completed scoring run ends the cycle: the script
+                        // starts over with a fresh collection round.
+                        collectDoneThisCycle = false
+                        flowerDoneThisCycle = false
+                        BlackBox.event("cycle_done", "cycle" to cycle, "fired" to fired, "totalScored" to totalScored)
+                        flywheel.spinToRpm(FLYWHEEL_READY_RPM)
+                    }
+
+                    AutonomyPhase.PARK -> {
+                        // ---- PHASE 5: PARK (the safety net — always runs) ----
+                        telemetry.addData("PHASE 5", "park (%.0fs left)".format(clock.remainingSec()))
+                        telemetry.update()
+                        BlackBox.event("phase", "name" to "5-park")
+                        runPark()
+                        break
+                    }
                 }
 
-                if (!clock.fits(MIN_CYCLE_REMAINING_SEC)) break
+                scheduler.complete()
             }
-
-            // ---- PHASE 5: PARK (time reserved by the clock; always runs) ----
-            telemetry.addData("PHASE 5", "park (%.0fs left)".format(clock.remainingSec()))
-            telemetry.update()
-            BlackBox.event("phase", "name" to "5-park")
-            // Back off ALONG THE ROBOT'S OWN HEADING (the old -X world move
-            // was sideways/toward-hive whenever align had rotated the bot).
-            val hdg = drive.pose.heading.toDouble()
-            runAction(
-                drive.actionBuilder(drive.pose)
-                    .strafeToConstantHeading(
-                        Vector2d(
-                            drive.pose.position.x - AutoPlan.PARK_BACKOFF_IN * cos(hdg),
-                            drive.pose.position.y - AutoPlan.PARK_BACKOFF_IN * sin(hdg),
-                        ),
-                    )
-                    .build(),
-            )
         } finally {
             // Always leave the robot safe, no matter where the phases exit.
             drive.setDrivePowers(PoseVelocity2d(Vector2d(0.0, 0.0), 0.0))
             intake.stop()
             flywheel.stop()
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.forcePoll()
             vision.close()
             BlackBox.event("auto_end")
             BlackBox.stop()
@@ -262,6 +403,120 @@ class BioBuzzAutonomous : LinearOpMode() {
     }
 
     // ================= phase helper loops =================
+
+    /**
+     * Publishes every phase with its priority and whether it can run now.
+     *
+     * The strategy itself lives in [PhasePolicy] — pure logic, unit-tested on
+     * the JVM. This method only gathers the live state and hands it over.
+     */
+    private fun phaseCandidates(
+        scheduler: PhaseScheduler,
+        polishDone: Boolean,
+        collectDoneThisCycle: Boolean,
+        flowerDoneThisCycle: Boolean,
+    ): List<PhaseTask> {
+        val now = System.nanoTime()
+        val px = drive.pose.position.x * 2.54
+        val py = drive.pose.position.y * 2.54
+        val hivePos = world.hive()
+        val hasCapacity = ballsHeld < MAX_BALLS_HELD
+
+        // A usable flower cluster (not in cooldown, reachable, capacity left).
+        val cluster = if (FLOWER_PULL_ENABLED && hasCapacity) {
+            world.bestFlowerCluster(px, py, clock.remainingSec(), ballsHeld, now)
+        } else {
+            null
+        }
+        // A single loose flower counts too: the StrategicPlanner will send
+        // the robot after one, and the scheduler must not refuse to let it.
+        val flowerAvailable = FLOWER_PULL_ENABLED && hasCapacity &&
+            (cluster != null || world.availableFlowers(now).isNotEmpty())
+
+        val state = PhaseState(
+            ballsHeld = ballsHeld,
+            alignedForFire = alignedForFire,
+            polishDone = polishDone,
+            collectDoneThisCycle = collectDoneThisCycle,
+            flowerDoneThisCycle = flowerDoneThisCycle,
+            robotXcm = px,
+            robotYcm = py,
+            hiveXcm = hivePos?.first,
+            hiveYcm = hivePos?.second,
+            flowerClusterAvailable = cluster != null,
+            flowerAvailable = flowerAvailable,
+            remainingSec = clock.remainingSec(),
+            reserveSec = clock.currentReserveSec(),
+        )
+        return phasePolicy.candidates(state, scheduler.current, scheduler.currentElapsedSec())
+    }
+
+    /**
+     * Called from inside a phase's own loop: "should I stop what I am doing
+     * and let a higher-priority phase take over?"
+     *
+     * This is what makes preemption real rather than theoretical: the phase
+     * yields within one iteration instead of running to its deadline.
+     */
+    private fun shouldYield(
+        scheduler: PhaseScheduler,
+        polishDone: Boolean,
+        collectDoneThisCycle: Boolean,
+        flowerDoneThisCycle: Boolean,
+    ): Boolean {
+        val running = scheduler.current ?: return false
+        val preemptor = scheduler.preemptorFor(
+            running,
+            phaseCandidates(scheduler, polishDone, collectDoneThisCycle, flowerDoneThisCycle),
+        )
+        if (preemptor != null) {
+            BlackBox.event(
+                "phase_preempt",
+                "from" to running.phase.name,
+                "to" to preemptor.phase.name,
+                "priority" to preemptor.priority,
+                "remainingSec" to clock.remainingSec(),
+            )
+        }
+        return preemptor != null
+    }
+
+    /**
+     * PHASE 5: back off along the robot's OWN heading.
+     *
+     * The old -X world move was sideways (or toward the hive) whenever
+     * align had rotated the bot; backing off along the heading always
+     * leaves the robot where it is facing.
+     */
+    private fun runPark() {
+        val hdg = drive.pose.heading.toDouble()
+        runAction(
+            drive.actionBuilder(drive.pose)
+                .strafeToConstantHeading(
+                    Vector2d(
+                        drive.pose.position.x - AutoPlan.PARK_BACKOFF_IN * cos(hdg),
+                        drive.pose.position.y - AutoPlan.PARK_BACKOFF_IN * sin(hdg),
+                    ),
+                )
+                .build(),
+        )
+    }
+
+    /**
+     * Distance from the robot to the nearest field wall, in cm.
+     *
+     * The park reserve scales with this: parked against a wall the back-off
+     * is nearly free, but out in the open the robot needs a moment to drive
+     * clear of the scoring traffic.
+     */
+    private fun distanceToNearestWallCm(): Double? {
+        if (!::drive.isInitialized) return null
+        val px = drive.pose.position.x * 2.54
+        val py = drive.pose.position.y * 2.54
+        val dx = fieldHalfWidthCm - abs(px)
+        val dy = fieldHalfHeightCm - abs(py)
+        return minOf(dx, dy).coerceAtLeast(0.0)
+    }
 
     /**
      * Runs a Road Runner action while continuously feeding the hybrid vision
@@ -272,7 +527,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         val packet = TelemetryPacket()
         var running = true
         while (running && opModeIsActive()) {
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             running = action.run(packet) // also updates pose (and vision correction)
             vision.updateRoadRunnerPose(drive.pose)
             report()
@@ -290,7 +545,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         val cmd = visionGuidance(drive, vision)
         cmd.start()
         while (!cmd.done() && opModeIsActive()) {
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             drive.updatePoseEstimate()
             vision.updateRoadRunnerPose(drive.pose)
             cmd.execute()
@@ -316,9 +571,20 @@ class BioBuzzAutonomous : LinearOpMode() {
      *      map never re-chases a collected ball,
      *   6. nothing worth doing (HOLD): sweep-search in place instead of the
      *      old blind forward creep.
-     * Bounded by AUTONOMOUS_COLLECT_TIMEOUT_MS.
+     * Bounded by AUTONOMOUS_COLLECT_TIMEOUT_MS, or earlier when [shouldYield]
+     * says a higher-priority phase wants the robot (the scheduler's
+     * preemption hook).
+     *
+     * [alreadyHeld] is what the hopper already contains from earlier cycles —
+     * the phase only tops the hopper up to MAX_BALLS_HELD, and the planner
+     * sees the TOTAL so its GO_SCORE / USE_FLOWER calls account for every
+     * ball we are carrying.
      */
-    private fun collectBalls(deadlineNanos: Long): Int {
+    private fun collectBalls(
+        deadlineNanos: Long,
+        alreadyHeld: Int = 0,
+        shouldYield: () -> Boolean = { false },
+    ): Int {
         var collected = 0
         var committedId: Int? = null
         var challengerId: Int? = null
@@ -327,13 +593,25 @@ class BioBuzzAutonomous : LinearOpMode() {
         var dodgeSign = 0        // latched dodge direction (+left / -right in RR strafe terms)
         var dodgeUntilNanos = 0L
         var blockedSinceNanos = 0L
-        val planner = StrategicPlanner()
+        // Use MCTS for deeper lookahead (falls back to greedy if over time budget)
+        val planner = MCTSPlanner(
+            playouts = MCTS_PLAYOUTS,
+            maxDepth = MCTS_MAX_DEPTH,
+            timeBudgetMs = MCTS_TIME_BUDGET_MS,
+        )
+        val shadowDashboard = ShadowPlannerDashboard()
 
         // The jam guard OWNS the intake during collection (full speed, coughs
         // on jams, brakes hard when fully jammed) — a jam can no longer stall
         // the phase silently.
-        while (opModeIsActive() && collected < MAX_BALLS_HELD && System.nanoTime() < deadlineNanos) {
-            NextMotor.motorEventLoop.poll()
+        val capacity = MAX_BALLS_HELD - alreadyHeld
+        while (opModeIsActive() && collected < capacity && System.nanoTime() < deadlineNanos) {
+            // Preemption hook: a higher-priority phase can take the robot.
+            if (shouldYield()) {
+                BlackBox.event("collect_yield", "balls" to collected)
+                break
+            }
+            ControlFrame.tick()
             drive.updatePoseEstimate()
             vision.updateRoadRunnerPose(drive.pose)
             report() // fuses sightings + hive into the WorldModel (and Black Box)
@@ -356,7 +634,12 @@ class BioBuzzAutonomous : LinearOpMode() {
             val matchRemainingSec = clock.remainingSec()
 
             // ---- 2. planner decision ----
-            val decision = planner.decide(world, collected, matchRemainingSec, px, py)
+            // The planner reasons in MATCH time, and needs the TOTAL number of
+            // balls in the hopper (this phase's pickups plus what we already
+            // hold), not just the pickups of this phase.
+            val decision = planner.decide(world, alreadyHeld + collected, matchRemainingSec, px, py)
+            // ---- Shadow Planner Dashboard ----
+            shadowDashboard.update(world, alreadyHeld + collected, matchRemainingSec, px, py, decision, planner)
             when (decision.action) {
                 PlannerAction.GO_SCORE, PlannerAction.USE_FLOWER, PlannerAction.PARK -> {
                     // Leave collection to the phase machine (flower / align / fire / park).
@@ -378,6 +661,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                 val current = committedId?.let { world.trackById(it) }
                 if (current == null) {
                     committedId = decision.targetId
+                    intake.markPickupStart() // reset encoder baseline for new target
                     challengerId = null; challengerWins = 0
                 } else if (decision.targetId != committedId) {
                     if (challengerId == decision.targetId) challengerWins++ else challengerWins = 1
@@ -388,6 +672,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                             "from" to committedId, "to" to decision.targetId, "why" to decision.rationale,
                         )
                         committedId = decision.targetId
+                        intake.markPickupStart() // reset encoder baseline for new target
                         challengerId = null; challengerWins = 0
                     }
                 } else {
@@ -466,14 +751,14 @@ class BioBuzzAutonomous : LinearOpMode() {
 
             val live = target.ageSec(now) <= WM_VISIBLE_FRESH_SEC
             telemetry.addData(
-                "COLLECT $collected/$MAX_BALLS_HELD",
+                "COLLECT ${alreadyHeld + collected}/$MAX_BALLS_HELD",
                 "%s %.0fcm %+.1fdeg %s".format(
                     target.label, distCm, bearingDeg, if (live) "[live]" else "[memory]",
                 ),
             )
             telemetry.update()
 
-            // ---- 5. pickup confirmation: current bump (physical) or settle ----
+            // ---- 5. pickup confirmation: current bump, settle, OR encoder delta ----
             val bumpPickup = bumped && distCm <= PICKUP_CONFIRM_CM * 1.5
             val settled = if (distCm <= PICKUP_CONFIRM_CM) {
                 if (closeSinceNanos == 0L) {
@@ -486,15 +771,20 @@ class BioBuzzAutonomous : LinearOpMode() {
                 closeSinceNanos = 0L
                 false
             }
+            // Encoder-based confirmation: each ball adds ~MIN_PICKUP_ENCODER_TICKS
+            val encoderPickup = intake.confirmPickupByEncoder(MIN_PICKUP_ENCODER_TICKS)
 
-            if (bumpPickup || settled) {
+            if (bumpPickup || settled || encoderPickup) {
                 collected++
                 world.removeBall(target.id)
                 committedId = null
                 closeSinceNanos = 0L
+                val how = if (bumpPickup) "current" else if (settled) "settled" else "encoder"
                 BlackBox.event(
                     "pickup",
-                    "label" to target.label, "how" to if (bumpPickup) "current" else "settled",
+                    "label" to target.label, "how" to how,
+                    "encoderDelta" to intake.lastPickupEncoderDelta,
+                    "totalPickups" to intake.confirmedPickups,
                 )
                 telemetry.addData(
                     "COLLECT pickup",
@@ -544,12 +834,20 @@ class BioBuzzAutonomous : LinearOpMode() {
      * FLOWER_APPROACH_CM (turn-toward while approaching), stops, runs the
      * CUSTOMIZABLE flowerPullRoutine, then settles the intake. Returns true
      * when a pull was actually performed.
+     *
+     * [shouldYield] lets the scheduler preempt the phase mid-approach.
      */
-    private fun useFlowerIfVisible(deadlineNanos: Long): Boolean {
+    private fun useFlowerIfVisible(deadlineNanos: Long, shouldYield: () -> Boolean = { false }): Boolean {
         var positioned = false
+        /** Track id of the flower we pulled (null when we only had a live sighting). */
+        var pulledFlowerId: Int? = null
 
         while (opModeIsActive() && System.nanoTime() < deadlineNanos) {
-            NextMotor.motorEventLoop.poll()
+            if (shouldYield()) {
+                BlackBox.event("flower_yield")
+                return false
+            }
+            ControlFrame.tick()
             drive.updatePoseEstimate()
             vision.updateRoadRunnerPose(drive.pose)
             val now = System.nanoTime()
@@ -560,7 +858,9 @@ class BioBuzzAutonomous : LinearOpMode() {
 
             val live = ballLocator.nearestFlower()
             val remembered = if (live == null) {
-                world.flowers()
+                // Only flowers that are not in a depletion cooldown are worth
+                // driving to — the WorldModel remembers which ones we emptied.
+                world.availableFlowers(now)
                     .filter { it.ageSec(now) <= DEAD_RECKON_MAX_AGE_SEC }
                     .minByOrNull { it.distanceTo(px, py) }
             } else {
@@ -591,6 +891,7 @@ class BioBuzzAutonomous : LinearOpMode() {
 
             if (distCm <= FLOWER_APPROACH_CM + 5.0) {
                 positioned = true
+                pulledFlowerId = remembered?.id
                 break
             }
 
@@ -615,18 +916,45 @@ class BioBuzzAutonomous : LinearOpMode() {
         NextMotor.motorEventLoop.poll()
         sleep(FLOWER_SETTLE_AFTER_PULL_MS)
         intake.stop()
+
+        // Record the depletion so the planner stops steering at this flower:
+        // the flower's own cooldown is set, and the cluster it belonged to is
+        // re-evaluated immediately (mid-match re-evaluation) instead of
+        // waiting for the next periodic rebuild.
+        val now = System.nanoTime()
+        val flowerId = pulledFlowerId
+        if (flowerId != null) {
+            world.markFlowerPulled(flowerId, now)
+        }
+        world.forceClusterRebuild(now)
+        BlackBox.event(
+            "flower_pulled",
+            "flowerId" to (flowerId ?: -1),
+            "clusterRevision" to world.flowerClusterRevision,
+        )
         return true
     }
 
     /**
      * PHASE 3 core: servo into the hive shooting window. Live tag first; when
      * the tag flickers out of view, dead-reckon toward the WorldModel's
-     * remembered hive position instead of sweeping blind. Returns true only
-     * when the live tag says ALIGNED — firing is skipped otherwise.
+     * remembered hive position instead of sweeping blind. Returns true when
+     * the live tag says ALIGNED (or IN_RANGE in desperation mode) — firing
+     * is skipped otherwise.
+     *
+     * [shouldYield] lets the scheduler preempt the phase mid-approach.
      */
-    private fun alignToHive(deadlineNanos: Long): Boolean {
+    private fun alignToHive(
+        deadlineNanos: Long,
+        desperationMode: Boolean = false,
+        shouldYield: () -> Boolean = { false },
+    ): Boolean {
         while (opModeIsActive() && System.nanoTime() < deadlineNanos) {
-            NextMotor.motorEventLoop.poll()
+            if (shouldYield()) {
+                BlackBox.event("align_yield")
+                return false
+            }
+            ControlFrame.tick()
             drive.updatePoseEstimate()
             vision.updateRoadRunnerPose(drive.pose)
 
@@ -664,7 +992,14 @@ class BioBuzzAutonomous : LinearOpMode() {
                 continue
             }
 
-            if (hive.zoneOf(target) == ScoringZone.ALIGNED) {
+            // In desperation mode, accept IN_RANGE (and even TOO_FAR if ShotPredictor gives decent P(hit))
+            val zone = hive.zoneOf(target)
+            val acceptZone = if (desperationMode) {
+                zone == ScoringZone.ALIGNED || zone == ScoringZone.IN_RANGE || zone == ScoringZone.TOO_FAR
+            } else {
+                zone == ScoringZone.ALIGNED
+            }
+            if (acceptZone) {
                 drive.setDrivePowers(PoseVelocity2d(Vector2d(0.0, 0.0), 0.0))
                 return true
             }
@@ -700,7 +1035,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         val spinDeadline = System.nanoTime() +
             (clock.remainingSec().coerceAtMost(AUTONOMY_FIRE_RESERVE_SEC) * 1e9).toLong()
         while (opModeIsActive() && !flywheel.isAtSpeed(rpm) && System.nanoTime() < spinDeadline) {
-            NextMotor.motorEventLoop.poll()
+            ControlFrame.tick()
             telemetry.addData("PHASE 4", "spinning up to %.0f RPM".format(rpm))
             telemetry.addData(
                 "Measured L/R",
@@ -727,6 +1062,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         val fireDeadline = System.nanoTime() +
             (clock.remainingSec().coerceAtMost(AUTONOMY_FIRE_RESERVE_SEC) * 1e9).toLong()
         while (fired < ballCount && opModeIsActive() && System.nanoTime() < fireDeadline) {
+            ControlFrame.tick()
             when {
                 stroking && loader.busy -> report()
                 stroking && !armed -> {
@@ -745,6 +1081,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                         while (opModeIsActive() && !flywheel.isAtSpeed(rpm) &&
                             System.nanoTime() < recoverBy
                         ) {
+                            ControlFrame.tick()
                             report()
                         }
                     }
@@ -764,7 +1101,7 @@ class BioBuzzAutonomous : LinearOpMode() {
 
     /** Combined telemetry: hive range/angle, RR (fused) pose, vision health. */
     private fun report(target: HiveTarget? = null) {
-        NextMotor.motorEventLoop.poll()
+        ControlFrame.forcePoll() // ensure motor commands flush for accurate telemetry
         val t = target ?: hive.update()
         tagOverlay.publish(t)
         hive.addTelemetry(telemetry, t)
@@ -776,13 +1113,20 @@ class BioBuzzAutonomous : LinearOpMode() {
         val now = System.nanoTime()
         world.update(ballLocator.sightings(), px, py, hdg, now)
         world.updateHive(t, px, py, hdg, now)
-        BlackBox.log(
-            "record" to "auto",
-            "poseXcm" to px, "poseYcm" to py, "headingRad" to hdg,
-            "hiveCm" to t?.distanceCm, "hiveBearing" to t?.bearingDeg,
-            "flyL" to flywheel.measuredLeftRpm(),
-            "flyR" to flywheel.measuredRightRpm(),
-            "batteryV" to ShotPredictor.reportHardwareMapVolts(hardwareMap),
+        BlackBox.state(
+            SessionState(
+                tNanos = now,
+                tMs = System.currentTimeMillis(),
+                poseXcm = px,
+                poseYcm = py,
+                headingRad = hdg,
+                hiveXcm = world.hive()?.first,
+                hiveYcm = world.hive()?.second,
+                hiveConfidence = world.hiveConfidence(),
+                flywheelLeftRpm = flywheel.measuredLeftRpm(),
+                flywheelRightRpm = flywheel.measuredRightRpm(),
+                batteryVolts = ShotPredictor.reportHardwareMapVolts(hardwareMap),
+            ),
         )
         world.logToBlackBox()
 

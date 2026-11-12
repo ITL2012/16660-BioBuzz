@@ -61,6 +61,10 @@ var SHOOTER_CALIBRATION_DISTANCE_CM = doubleArrayOf(
 // save battery / silence the wheels instead. --
 const val FLYWHEEL_PRIME_ENABLED = true
 const val FLYWHEEL_PRIME_RPM = 2000.0
+// READY_RPM: always-on "warm" speed (2500 RPM) — instant spin-up to any shooting
+// speed, draws ~1.5A vs ~4A at 6000 RPM. Used during autonomous/teleop when
+// not actively shooting but wanting instant response.
+const val FLYWHEEL_READY_RPM = 2500.0
 // Fire only when BOTH wheels are within this many RPM of the commanded speed.
 const val FLYWHEEL_SPEED_TOLERANCE_RPM = 150.0
 // How long the intake runs to feed one ball into the spinning flywheel.
@@ -126,10 +130,9 @@ const val BLACKBOX_ENABLED = true          // master switch
 const val BLACKBOX_FRAME_CAPTURE_FPS = 5.0 // JPEG frames/sec saved PER camera
 
 // ================== CAMERA FRAME CAPTURE (for post-match analysis) ==================
-const val FRAME_CAPTURE_ENABLED = true           // master toggle
-const val FRAME_CAPTURE_FPS = 5                  // max frames/sec per camera
-const val FRAME_CAPTURE_MAX_MB = 200             // total budget across both cameras
-const val FRAME_CAPTURE_DIR = "CameraFrames"     // subfolder under /sdcard/FIRST/
+// The frames go into the session's SQLite file as BLOBs, so a match leaves
+// the robot as ONE file. The rates and the budget below are the only knobs.
+const val FRAME_CAPTURE_ENABLED = true           // master toggle for frame capture
 const val BLACKBOX_MAX_SESSION_MB = 400.0   // storage budget per OpMode run
 const val BLACKBOX_STATE_LOG_HZ = 10.0     // state lines per second
 
@@ -246,6 +249,124 @@ const val PLANNER_PARK_SEC = 2.0            // final park move
 const val PLANNER_OPPONENT_DISCOUNT = 0.5   // value multiplier when an opponent is closer
 const val PLANNER_ENDGAME_MARGIN_SEC = 8.0  // don't start anything that can't finish
 
+/**
+ * How long a TYPICAL alignment takes, in seconds.
+ *
+ * The align phase has a hard cap of HiveScoringConfig.ALIGN_TIMEOUT_MS, but
+ * charging the robot that worst case would make it refuse to score in the
+ * endgame — a slow alignment is better than no score at all. The policy
+ * budgets this typical figure; the phase deadline still cuts a slow
+ * alignment short so the park is never missed.
+ */
+const val ALIGN_ESTIMATE_SEC = 4.0
+
+/**
+ * Roughly how long one more ball takes to gather: the drive to it plus the
+ * intake handling. Used to work out whether there is still time to fill the
+ * hopper AND score afterwards — charging the whole 9-second collection
+ * phase instead would make the robot bank a half-full hopper early.
+ */
+const val COLLECT_PER_BALL_SEC = 2.5
+
+// ================== MCTS PLANNER (deep lookahead) ==================
+/** Playouts per decide() call. More playouts = deeper lookahead, more CPU. */
+const val MCTS_PLAYOUTS = 128
+/** Tree depth: how many actions ahead the search looks. */
+const val MCTS_MAX_DEPTH = 4
+/** Hard wall-clock budget for one decide() call (ms). Keeps the RC responsive. */
+const val MCTS_TIME_BUDGET_MS = 60.0
+/**
+ * Progressive widening coefficient: a node may hold at most
+ * `1 + floor(k * sqrt(visits))` children. Keeps the tree from exploding into
+ * a combinatorial mess when there are many candidate actions, while still
+ * letting a promising branch earn more branches.
+ */
+const val MCTS_PROGRESSIVE_WIDENING_K = 1.4
+/**
+ * Probability that a playout step follows the StrategicPlanner's pick
+ * (policy guidance). The rest of the steps sample by value density so the
+ * search still explores alternatives the heuristic dislikes.
+ */
+const val MCTS_HEURISTIC_WEIGHT = 0.65
+/** Temperature of the value-density softmax used for exploratory playout steps. */
+const val MCTS_SOFTMAX_TEMPERATURE = 2.0
+
+// ================== OPPONENT PARTICLE FILTER ==================
+/** Particles per tracked opponent. More = better occlusion survival, more CPU. */
+const val OPP_PARTICLE_COUNT = 40
+/** Position process noise per sqrt(second), cm. */
+const val OPP_PARTICLE_POS_NOISE_CM = 8.0
+/** Velocity process noise per sqrt(second), cm/s. */
+const val OPP_PARTICLE_VEL_NOISE_CM_PER_SEC = 15.0
+/** Measurement noise of an opponent detection, cm (sigma of the Gaussian). */
+const val OPP_PARTICLE_MEAS_NOISE_CM = 30.0
+/** Resample when the effective sample size falls below this fraction of N. */
+const val OPP_PARTICLE_RESAMPLE_ESS_RATIO = 0.5
+/** Fraction of particles re-injected (spread) after a resample, for diversity. */
+const val OPP_PARTICLE_REINJECT_RATIO = 0.25
+/** EMA weight of the particle-filter position when fusing into a track. */
+const val OPP_PARTICLE_FUSE_ALPHA = 0.6
+/**
+ * How much of the measured velocity is blended into each particle's own
+ * velocity. High enough that the cloud follows the opponent between
+ * frames, low enough that the process noise keeps a spread around it.
+ */
+const val OPP_PARTICLE_VEL_HINT_ALPHA = 0.7
+
+// ================== FLOWER CLUSTERING + DEPLETION ==================
+/** Lower clamp for the adaptive clustering epsilon, cm. */
+const val FLOWER_CLUSTER_EPS_MIN_CM = 25.0
+/** Upper clamp for the adaptive clustering epsilon, cm. */
+const val FLOWER_CLUSTER_EPS_MAX_CM = 90.0
+/**
+ * Multiplier on the mean nearest-neighbour distance of the visible flowers.
+ * Sparse field -> big epsilon (group loose flowers); dense patch -> small
+ * epsilon (don't merge separate patches).
+ */
+const val FLOWER_CLUSTER_EPS_KNN_FACTOR = 1.8
+/** How often the cluster set is rebuilt, seconds. */
+const val FLOWER_CLUSTER_REBUILD_SEC = 1.0
+/** Base cooldown after a flower (or cluster) is pulled, seconds. */
+const val FLOWER_COOLDOWN_BASE_SEC = 30.0
+/** Extra cooldown per previous pull of the same flower/cluster, seconds. */
+const val FLOWER_COOLDOWN_PER_PULL_SEC = 10.0
+/** Regrowth time after the cooldown expires, seconds. */
+const val FLOWER_REGEN_SEC = 15.0
+/**
+ * Radius (cm) within which two nectar pulls count as the SAME spot on the
+ * field. Pulls inside this radius merge into one depleted patch, so the
+ * cooldown grows with every pull from the same flower bed instead of being
+ * reset by each new pull.
+ */
+const val FLOWER_PATCH_MERGE_CM = 45.0
+
+// ================== DYNAMIC RESERVES (PhaseClock) ==================
+/** Fixed spin-up + alignment buffer in the fire reserve, seconds. */
+const val RESERVE_FIRE_BASE_SEC = 3.0
+/** Feed time per ball in the fire reserve, seconds. */
+const val RESERVE_FIRE_PER_BALL_SEC = 0.8
+/** Clamp on the computed fire reserve, seconds. */
+const val RESERVE_FIRE_MAX_SEC = 12.0
+/** Clamp on the computed park reserve, seconds. */
+const val RESERVE_PARK_MAX_SEC = 8.0
+/** Extra seconds reserved for parking when the robot is far from a wall. */
+const val RESERVE_PARK_DISTANT_SEC = 4.0
+/** Distance (cm) beyond which the robot is considered "far" from any wall. */
+const val RESERVE_PARK_DISTANT_CM = 120.0
+
+// ================== PHASE SCHEDULER ==================
+/**
+ * A higher-priority phase may preempt the running one, but only by this
+ * much priority — avoids thrashing between two nearly-equal phases.
+ */
+const val SCHEDULER_PREEMPT_PRIORITY_MARGIN = 10
+/**
+ * A running phase is only preempted when at least this much of its budget
+ * is still unspent — otherwise we let it finish (finishing is cheap, the
+ * switch is not).
+ */
+const val SCHEDULER_PREEMPT_MIN_REMAINING_SEC = 1.5
+
 // ================== REFLEXES (below-the-planner safety) ==================
 const val INTAKE_JAM_CURRENT_A = 3.5      // amps above this (while spinning) = jam suspected
 const val INTAKE_JAM_SUSTAIN_MS = 300.0   // current must stay high this long
@@ -259,6 +380,8 @@ const val SHADOW_PLANNER_ENABLED = true
 // Strategic/Pathfinding Constants (BIOBUZZ)
 const val NECTAR_SCORE_MULTIPLIER = 2.0 // Nectar is worth more points than Pollen
 const val ROBOT_SPEED_CM_PER_SEC = 100.0 // Placeholder: Measure actual robot speed
+/** Seconds of travel budgeted per cm when estimating a time reserve. */
+const val RESERVE_TRAVEL_SEC_PER_CM = 1.0 / ROBOT_SPEED_CM_PER_SEC
 const val FLYWHEEL_SPINUP_SEC = 2.0 // Placeholder: informational only; spin-up runs in parallel with travel
 const val FLYWHEEL_PRESPIN_BALL_COUNT = 2 // Start warming the flywheel once we hold this many balls
 
@@ -293,6 +416,7 @@ const val LAST_SLOT_PREFER_HIGHEST_VALUE = true
 const val AUTONOMOUS_COLLECT_TIMEOUT_MS = 9000.0 // hard cap on the collection phase
 const val PICKUP_CONFIRM_CM = 25.0   // ball closer than this can count as picked up
 const val PICKUP_SETTLE_MS = 400.0    // must stay that close this long to confirm
+const val MIN_PICKUP_ENCODER_TICKS = 50L // encoder ticks per ball (MEASURE: ticks added per ball)
 
 // ================== FLOWER PULL-OUT — CUSTOMIZE FOR YOUR MECHANISM ==================
 const val FLOWER_PULL_ENABLED = true         // autonomous tries flowers at all
@@ -325,14 +449,14 @@ var flowerPullRoutine: (Intake, Loader) -> Unit = { intake, _ ->
     intake.spinUp(-1.0)
     // The NextFTC event loop must be polled or the spinUp setpoint never
     // reaches the motor during the blind sleep below.
-    dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+    ControlFrame.forcePoll()
     try {
         Thread.sleep(1000)
     } catch (_: InterruptedException) {
         Thread.currentThread().interrupt()
     }
     intake.stop()
-    dev.nextftc.hardware.actuators.NextMotor.motorEventLoop.poll()
+    ControlFrame.forcePoll()
 }
 
 /** Type of ball collected, for the ball counter. UNKNOWN = source cannot identify type (e.g. beam-break sensor). */

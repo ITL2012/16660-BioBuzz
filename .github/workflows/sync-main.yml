@@ -1,0 +1,23 @@
+name: Auto-sync main
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SYNC_PAT }}
+          fetch-depth: 0
+
+      - run: |
+          if [ "${{ github.repository }}" = "West-Robotics/16660-BioBuzz" ]; then
+            TARGET="ITL2012/16660-BioBuzz"
+          else
+            TARGET="West-Robotics/16660-BioBuzz"
+          fi
+          git remote add mirror "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${TARGET}.git"
+          git push mirror main
