@@ -30,7 +30,6 @@ import com.acmerobotics.roadrunner.VelConstraint
 import com.acmerobotics.roadrunner.Vector2d
 import com.acmerobotics.roadrunner.ftc.DownsampledWriter
 import com.acmerobotics.roadrunner.ftc.FlightRecorder
-import com.acmerobotics.roadrunner.ftc.LazyHardwareMapImu
 import com.acmerobotics.roadrunner.ftc.throwIfModulesAreOutdated
 import com.acmerobotics.roadrunner.ftc.OverflowEncoder
 import com.acmerobotics.roadrunner.ftc.RawEncoder
@@ -38,6 +37,7 @@ import com.qualcomm.hardware.lynx.LynxModule
 import com.qualcomm.hardware.rev.RevHubOrientationOnRobot
 import com.qualcomm.robotcore.hardware.DcMotor
 import com.qualcomm.robotcore.hardware.DcMotorEx
+import com.qualcomm.robotcore.hardware.DcMotorSimple
 import com.qualcomm.robotcore.hardware.HardwareMap
 import com.qualcomm.robotcore.hardware.IMU
 import com.qualcomm.robotcore.hardware.VoltageSensor
@@ -45,6 +45,7 @@ import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit
 import org.firstinspires.ftc.robotcore.external.navigation.YawPitchRollAngles
 import org.firstinspires.ftc.teamcode.DeadWheelMath
 import org.firstinspires.ftc.teamcode.DrivetrainSpec
+import org.firstinspires.ftc.teamcode.DriveConfig
 import org.firstinspires.ftc.teamcode.DEAD_WHEEL_PAR0_NAME
 import org.firstinspires.ftc.teamcode.DEAD_WHEEL_PAR1_NAME
 import org.firstinspires.ftc.teamcode.DEAD_WHEEL_PERP_NAME
@@ -92,28 +93,50 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         var lateralInPerTick = DrivetrainSpec.rrLateralInPerTick
         var trackWidthTicks = DrivetrainSpec.rrTrackWidthTicks
 
-        // feedforward parameters (in tick units)
-        var kS = 0.0
-        var kV = 0.0
-        var kA = 0.0
+        // Feedforward parameters.
+        //
+        // These are DERIVED from the hardware measurements in DrivetrainSpec
+        // instead of being left at zero, because a zero feedforward means
+        // Road Runner commands NO motor power at all — every trajectory move
+        // (the autonomous park move, for one) silently does nothing. The
+        // derived values get the robot driving on the first run; refine them
+        // live via FTC Dashboard once there is time.
+        //
+        //   kV: derived from the motor's free speed (full power => full speed)
+        //   kS: static friction, 5% of full power to break loose
+        //   kA: acceleration term, 0 until the robot is driving cleanly
+        var kS = DrivetrainSpec.RR_KS
+        var kV = DrivetrainSpec.rrKV
+        var kA = DrivetrainSpec.RR_KA
 
-        // path profile parameters (in inches)
+        // Path profile parameters (in inches)
         var maxWheelVel = 50.0
         var minProfileAccel = -30.0
         var maxProfileAccel = 50.0
 
-        // turn profile parameters (in radians)
+        // Turn profile parameters (in radians)
         var maxAngVel = Math.PI // shared with path
         var maxAngAccel = Math.PI
 
-        // path controller gains
-        var axialGain = 0.0
-        var lateralGain = 0.0
-        var headingGain = 0.0 // shared with turn
+        // Path controller gains.
+        //
+        // Road Runner's holonomic controller computes
+        //     command = targetVelocity + axialGain * positionError + axialVelGain * velocityError
+        // so these are "inches/sec per inch of error" and "inches/sec per
+        // inch/sec of error". Zero gains means the controller contributes
+        // NOTHING — the robot would coast on feedforward alone and drift.
+        //
+        // The defaults below are deliberately gentle: a mecanum that is
+        // over-gained oscillates, and an oscillating robot is worse than one
+        // that converges slowly. Tune upward only if the robot visibly lags
+        // its trajectory.
+        var axialGain = 2.0
+        var lateralGain = 2.0
+        var headingGain = 2.0 // shared with turn
 
-        var axialVelGain = 0.0
-        var lateralVelGain = 0.0
-        var headingVelGain = 0.0 // shared with turn
+        var axialVelGain = 0.5
+        var lateralVelGain = 0.5
+        var headingVelGain = 0.5 // shared with turn
     }
 
     val kinematics = MecanumKinematics(
@@ -140,7 +163,47 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
 
     val voltageSensor: VoltageSensor
 
-    val lazyImu: com.acmerobotics.roadrunner.ftc.LazyImu?
+    /**
+     * The IMU, if it is present AND initializes successfully.
+     *
+     * This is deliberately EAGER and wrapped in try/catch rather than lazy.
+     * Road Runner's `LazyHardwareMapImu.get()` calls `imu.initialize()`, which
+     * THROWS if the IMU is present in the config but unhealthy (a loose hub
+     * cable, a wrong orientation, a hub that has not finished booting). Because
+     * the localizers call `get()` from their constructor, a lazy IMU meant a
+     * bad IMU could crash EVERY OpMode that builds a drive — including the
+     * bench tests you would use to diagnose it.
+     *
+     * With this, a broken IMU downgrades the robot to encoder-only heading
+     * (from the dead wheels or the drive wheels) instead of killing the
+     * OpMode. The robot still drives; it just has worse heading.
+     *
+     * Null = no usable IMU. See [imuProblem] for why.
+     */
+    val imu: IMU?
+
+    /** Human-readable reason the IMU is unavailable (null when it works). */
+    val imuProblem: String?
+
+    /**
+     * Zeroes the IMU yaw so heading reads 0 for the robot's CURRENT
+     * orientation.
+     *
+     * Called automatically at construction, and again by [resetHeading]. This
+     * is what makes the IMU a usable BACKUP for the dead wheels: without a
+     * zero, the heading is an arbitrary angle left over from whenever the
+     * hub was powered on, so a field-centric drive or an autonomous turn
+     * would be off by that unknown angle. Zeroing at the start of every
+     * OpMode makes heading meaningful and repeatable.
+     */
+    fun resetHeading() {
+        try {
+            imu?.resetYaw()
+        } catch (_: Exception) {
+            // A reset failure is not fatal — the heading is still usable, it
+            // just is not zeroed.
+        }
+    }
 
     /** Pluggable localization; defaults to mecanum + IMU. Swappable for dead wheels / Pinpoint. */
     var localizer: Localizer
@@ -258,7 +321,22 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         val leftBack = OverflowEncoder(RawEncoder(this@MecanumDrive.leftBack))
         val rightBack = OverflowEncoder(RawEncoder(this@MecanumDrive.rightBack))
         val rightFront = OverflowEncoder(RawEncoder(this@MecanumDrive.rightFront))
-        private val imu: IMU? = if (imuAvailable) lazyImu?.get() else null
+        private val imu: IMU? = if (imuAvailable) this@MecanumDrive.imu else null
+
+        init {
+            // The SDK already flips the reported position for a REVERSE motor,
+            // and Road Runner's RawEncoder flips it AGAIN for a REVERSE motor.
+            // Flipping the ENCODER direction here cancels that second flip, so
+            // the encoder value Road Runner sees is the SAME value NextFTC's
+            // Drivetrain sees (SDK-adjusted): all four wheels count UP when
+            // the robot moves forward. Road Runner's kinematics assumes exactly
+            // that, so the odometry stays correct instead of silently driving
+            // the pose sideways.
+            leftFront.direction = driveEncoderDirection(DriveConfig.FL_REVERSED)
+            leftBack.direction = driveEncoderDirection(DriveConfig.BL_REVERSED)
+            rightBack.direction = driveEncoderDirection(DriveConfig.BR_REVERSED)
+            rightFront.direction = driveEncoderDirection(DriveConfig.FR_REVERSED)
+        }
 
         private var lastLeftFrontPos = 0
         private var lastLeftBackPos = 0
@@ -420,7 +498,7 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         private val par0 = OverflowEncoder(RawEncoder(par0Motor))
         private val par1 = OverflowEncoder(RawEncoder(par1Motor))
         private val perp = OverflowEncoder(RawEncoder(perpMotor))
-        private val imu: IMU? = if (imuAvailable) lazyImu?.get() else null
+        private val imu: IMU? = if (imuAvailable) this@MecanumDrive.imu else null
 
         private val inPerTick = DrivetrainSpec.deadWheelInPerTick
         private val wheels = DrivetrainSpec.deadWheelsIn()
@@ -520,18 +598,56 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         rightBack.zeroPowerBehavior = DcMotor.ZeroPowerBehavior.BRAKE
         rightFront.zeroPowerBehavior = DcMotor.ZeroPowerBehavior.BRAKE
 
-        // TODO: reverse motor directions if needed
-        //   leftFront.direction = DcMotorSimple.Direction.REVERSE
+        // Motor polarity comes from DriveConfig — the SAME table the NextFTC
+        // Drivetrain (teleop / bench OpModes) reads. Before this, the two
+        // drive paths had separate direction logic and could disagree about
+        // which way the robot actually faced.
+        //
+        // Road Runner needs the ENCODER direction flipped to match each
+        // reversed motor (its RawEncoder reads the raw count, so the motor
+        // reversal and the encoder reversal must be applied together) —
+        // see the DriveLocalizer below.
+        leftFront.direction =
+            if (DriveConfig.FL_REVERSED) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
+        leftBack.direction =
+            if (DriveConfig.BL_REVERSED) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
+        rightBack.direction =
+            if (DriveConfig.BR_REVERSED) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
+        rightFront.direction =
+            if (DriveConfig.FR_REVERSED) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
 
-        // IMU is OPTIONAL — try to get it, but don't crash if not configured.
-        lazyImu = try {
-            LazyHardwareMapImu(
-                hardwareMap,
-                RR_IMU_NAME,
-                RevHubOrientationOnRobot(PARAMS.logoFacingDirection, PARAMS.usbFacingDirection),
+        // IMU is OPTIONAL — but "optional" has to mean it can never take the
+        // robot down. Try to initialize it; on any failure, record why and
+        // carry on with encoder-only heading.
+        var imuDevice: IMU? = null
+        var imuError: String? = null
+        try {
+            val dev = hardwareMap.get(IMU::class.java, RR_IMU_NAME)
+            dev.initialize(
+                IMU.Parameters(
+                    RevHubOrientationOnRobot(PARAMS.logoFacingDirection, PARAMS.usbFacingDirection)
+                )
             )
-        } catch (_: Exception) {
-            null
+            // initialize() can succeed while the sensor is still settling, so
+            // wait for a real quaternion before trusting it.
+            val deadline = System.currentTimeMillis() + IMU_INIT_TIMEOUT_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (dev.robotOrientationAsQuaternion.acquisitionTime != 0L) break
+                Thread.sleep(10)
+            }
+            imuDevice = dev
+        } catch (e: Exception) {
+            imuError = e.message ?: e.javaClass.simpleName
+        }
+        imu = imuDevice
+        imuProblem = imuError
+        imuDevice?.let {
+            // Zero the heading so it starts at 0 for the robot's current
+            // orientation (see resetHeading).
+            try {
+                it.resetYaw()
+            } catch (_: Exception) {
+            }
         }
 
         voltageSensor = hardwareMap.voltageSensor.iterator().next()
@@ -543,7 +659,7 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         val par1Motor = tryGetMotor(hardwareMap, DEAD_WHEEL_PAR1_NAME)
         val perpMotor = tryGetMotor(hardwareMap, DEAD_WHEEL_PERP_NAME)
         usingDeadWheels = par0Motor != null && par1Motor != null && perpMotor != null
-        val imuAvailable = lazyImu != null
+        val imuAvailable = imu != null
         localizer = if (usingDeadWheels) {
             DeadWheelLocalizer(initialPose, par0Motor!!, par1Motor!!, perpMotor!!, imuAvailable)
         } else {
@@ -816,6 +932,24 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
     companion object {
         @JvmStatic
         val PARAMS = Params()
+
+        /** How long to wait for the IMU to produce a valid orientation. */
+        const val IMU_INIT_TIMEOUT_MS = 1500L
+
+        /**
+         * The encoder direction that makes Road Runner's odometry agree with
+         * the SDK-adjusted position the NextFTC drivetrain uses.
+         *
+         * The SDK negates `currentPosition` for a REVERSE motor, and Road
+         * Runner's `RawEncoder` negates it once more. So for a motor whose
+         * [DriveConfig] flag says REVERSED, the encoder direction must be
+         * REVERSE to cancel the extra flip — leaving all four wheels counting
+         * UP when the robot drives forward, which is what Road Runner's
+         * kinematics assumes.
+         */
+        @JvmStatic
+        fun driveEncoderDirection(motorReversed: Boolean): DcMotorSimple.Direction =
+            if (motorReversed) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
     }
 }
 

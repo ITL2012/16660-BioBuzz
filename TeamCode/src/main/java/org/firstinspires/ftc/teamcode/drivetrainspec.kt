@@ -73,6 +73,78 @@ object DrivetrainSpec {
     /** Centimeters of travel per encoder tick (one full tick of wheel rotation). */
     val driveCmPerTick: Double = PI * DRIVE_WHEEL_DIAMETER_CM / driveTicksPerWheelRev
 
+    /**
+     * Free speed of ONE drive motor in wheel RPM — the maximum the motor can
+     * produce (the gearbox ratio is already folded into the wheel RPM).
+     *
+     * goBILDA 5203-2402-0019 = 312 RPM. This is the number that makes the
+     * Road Runner feedforward derivable instead of tuned (see [rrKV]).
+     */
+    const val DRIVE_MOTOR_MAX_RPM = 312.0
+
+    /**
+     * Free speed of the drive wheels with the motor at full power, in
+     * inches/sec of wheel travel.
+     *
+     *     v_free = RPM * pi * diameter / 60  (in cm/sec), then / 2.54
+     */
+    val driveFreeSpeedInPerSec: Double =
+        DRIVE_MOTOR_MAX_RPM * PI * DRIVE_WHEEL_DIAMETER_CM / 60.0 / 2.54
+
+    /**
+     * Road Runner's velocity feedforward, DERIVED from the hardware so the
+     * robot can drive without a tuning session.
+     *
+     * Road Runner 1.0 computes motor power as
+     *
+     *     power = (kS * sign(v) + kV * v_ticks + kA * a_ticks) / batteryVolts
+     *
+     * where `v_ticks` is wheel velocity in TICKS per second. Note the two
+     * things that are easy to get wrong here:
+     *
+     *   1. `kS` and `kV` are in VOLTS, not in normalized power. Road Runner
+     *      divides the result by the measured battery voltage, so `kV` is
+     *      "volts of motor output per tick/sec of wheel speed".
+     *   2. The code applies `kV / inPerTick` to a velocity in INCHES/sec, so
+     *      `kV` must be in "volts per tick/sec" while the effective gain is
+     *      in "volts per inch/sec".
+     *
+     * At full power the motor drives the wheel at [driveFreeSpeedInPerSec].
+     * So the feedforward that asks for exactly the battery voltage at free
+     * speed satisfies:
+     *
+     *     kS + (kV / inPerTick) * v_free = batteryVolts
+     *  => kV = inPerTick * (batteryVolts - kS) / v_free
+     *
+     * This is the physically correct starting point: full power => full
+     * speed. It is deliberately conservative — the real value is a little
+     * HIGHER because a loaded wheel never quite reaches free speed, which
+     * shows up as mild under-driving that the feedback gains absorb, rather
+     * than the violent over-driving that a too-low kV causes.
+     */
+    val rrKV: Double = driveCmPerTick / 2.54 * (RR_BATTERY_VOLTS - RR_KS) / driveFreeSpeedInPerSec
+
+    /**
+     * Static-friction feedforward, in VOLTS: the motor output needed just to
+     * break the robot loose. 0.6 V is about 5% of a 12.6 V battery — enough
+     * to start moving, not enough to lurch. (For reference, a published
+     * Road Runner 1.0 tuning session on a similar mecanum landed at 0.78 V.)
+     */
+    const val RR_KS = 0.6
+
+    /**
+     * Nominal battery voltage used for the derivation. Road Runner divides by
+     * the MEASURED voltage at runtime, so this only sets the reference point.
+     */
+    const val RR_BATTERY_VOLTS = 12.6
+
+    /**
+     * Acceleration feedforward, in volts per tick/sec^2. Small by design: the
+     * position controller handles the bulk of the acceleration, and an
+     * over-large kA makes the robot lurch at the start of every trajectory.
+     */
+    const val RR_KA = 0.0
+
     /** Road Runner's inPerTick: encoder ticks -> inches of travel. */
     val rrInPerTick: Double = driveCmPerTick / 2.54
 

@@ -56,23 +56,26 @@ private fun nextYellowJacket(
 
 class Drivetrain : Mechanism {
 
+    // Motor polarity comes from DriveConfig — the ONE table both this class
+    // and Road Runner's MecanumDrive read, so the teleop and the autonomous
+    // can never disagree about which way a wheel is wired.
     val FrontLeft = nextYellowJacket(DrivetrainFrontLeft, DRIVE_MOTOR_MAX_RPM, DRIVE_MOTOR_ENCODER_CPR) {
-        direction = NextMotor.Direction.FORWARD // use FORWARD or REVERSE
+        direction = if (DriveConfig.FL_REVERSED) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
         zeroPowerBehavior = NextMotor.ZeroPowerBehavior.BRAKE // use BRAKE or FLOAT
     }
 
     val FrontRight = nextYellowJacket(DrivetrainFrontRight, DRIVE_MOTOR_MAX_RPM, DRIVE_MOTOR_ENCODER_CPR) {
-        direction = NextMotor.Direction.FORWARD
+        direction = if (DriveConfig.FR_REVERSED) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
         zeroPowerBehavior = NextMotor.ZeroPowerBehavior.BRAKE // use BRAKE or FLOAT
     }
 
     val BackLeft = nextYellowJacket(DrivetrainBackLeft, DRIVE_MOTOR_MAX_RPM, DRIVE_MOTOR_ENCODER_CPR) {
-        direction = NextMotor.Direction.FORWARD
+        direction = if (DriveConfig.BL_REVERSED) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
         zeroPowerBehavior = NextMotor.ZeroPowerBehavior.BRAKE // use BRAKE or FLOAT
     }
 
     val BackRight = nextYellowJacket(DrivetrainBackRight, DRIVE_MOTOR_MAX_RPM, DRIVE_MOTOR_ENCODER_CPR) {
-        direction = NextMotor.Direction.FORWARD
+        direction = if (DriveConfig.BR_REVERSED) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
         zeroPowerBehavior = NextMotor.ZeroPowerBehavior.BRAKE // use BRAKE or FLOAT
     }
 
@@ -163,30 +166,27 @@ class Drivetrain : Mechanism {
         )
     }
 
+    /**
+     * Teleop drive: mixes driver intent into wheel commands and commands them
+     * as velocity setpoints.
+     *
+     * The mixing lives in [DriveConfig.mix] so this path and the Road Runner
+     * path use the SAME matrix and the SAME motor polarity. (The old inline
+     * copy here had a different turn sign from the proven JJ scheme, which is
+     * why the "JJ raw-stick" toggle did not actually reproduce JJ's scheme.)
+     *
+     * @param forward +forward / -backward, in [-1, 1]
+     * @param strafe  +right / -left, in [-1, 1]
+     * @param turn    +right (clockwise) / -left (counter-clockwise), in [-1, 1]
+     */
     fun driveTeleOp(forward: Double, strafe: Double, turn: Double) {
-        var frontLeft = forward + strafe + turn
-        var frontRight = forward - strafe - turn
-        var backLeft = forward - strafe + turn
-        var backRight = forward + strafe - turn
+        // mix() returns FL, FR, BL, BR in that order.
+        val wheels = DriveConfig.mix(forward, strafe, turn)
 
-        // Normalize so none exceeds 1.0
-        val max = maxOf(
-            1.0,
-            kotlin.math.abs(frontLeft),
-            kotlin.math.abs(frontRight),
-            kotlin.math.abs(backLeft),
-            kotlin.math.abs(backRight)
-        )
-
-        frontLeft /= max
-        frontRight /= max
-        backLeft /= max
-        backRight /= max
-
-        FrontLeft.setVelocitySetpoint((frontLeft * DRIVE_MOTOR_MAX_RPM).rpm)
-        FrontRight.setVelocitySetpoint((frontRight * DRIVE_MOTOR_MAX_RPM).rpm)
-        BackLeft.setVelocitySetpoint((backLeft * DRIVE_MOTOR_MAX_RPM).rpm)
-        BackRight.setVelocitySetpoint((backRight * DRIVE_MOTOR_MAX_RPM).rpm)
+        FrontLeft.setVelocitySetpoint((wheels[0] * DRIVE_MOTOR_MAX_RPM).rpm)
+        FrontRight.setVelocitySetpoint((wheels[1] * DRIVE_MOTOR_MAX_RPM).rpm)
+        BackLeft.setVelocitySetpoint((wheels[2] * DRIVE_MOTOR_MAX_RPM).rpm)
+        BackRight.setVelocitySetpoint((wheels[3] * DRIVE_MOTOR_MAX_RPM).rpm)
     }
 
 
@@ -337,22 +337,62 @@ class FlyWheel(
     /** True when at least one wheel exists. */
     val anyMotor: Boolean get() = hasLeft || hasRight
 
-    private fun motor(name: String, reverse: Boolean): NextMotor? =
-        if (if (reverse) hasRight else hasLeft)
+    /**
+     * Builds one flywheel motor, applying its spin direction.
+     *
+     * The two flywheels squeeze the ball from opposite sides, so they MUST
+     * counter-rotate for the ball to be launched straight through. Which
+     * physical wheel is "left" vs "right" depends on how the motors are
+     * mounted, so the directions are constants:
+     *
+     *   * [FLYWHEEL_LEFT_REVERSED]  — flip to change the LEFT wheel's spin
+     *   * [FLYWHEEL_RIGHT_REVERSED] — flip to change the RIGHT wheel's spin
+     *
+     * HOW TO SWAP THE FLYWHEEL SPIN DIRECTION (see README Chapter 10.4):
+     *   1. If the ball comes out BACKWARD (shot toward the robot), flip BOTH
+     *      constants — that reverses which way the launcher throws.
+     *   2. If only ONE wheel spins the wrong way, flip only that one.
+     *   3. If the wheels counter-rotate but the ball squirts sideways, the
+     *      two motors are SWAPPED left-for-right in the hub config — swap the
+     *      names there (or swap the two constants' meaning).
+     *   4. Verify with the "Flywheel Direction Test" OpMode: it spins each
+     *      wheel alone and reports the commanded vs measured RPM, so a wheel
+     *      that is reversed shows up immediately.
+     */
+    private fun motor(name: String, exists: Boolean, reversed: Boolean): NextMotor? =
+        if (exists)
             nextYellowJacket(name, FLYWHEEL_MOTOR_MAX_RPM, FLYWHEEL_MOTOR_ENCODER_CPR).apply {
-                direction = if (reverse) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
+                direction = if (reversed) NextMotor.Direction.REVERSE else NextMotor.Direction.FORWARD
                 zeroPowerBehavior = NextMotor.ZeroPowerBehavior.FLOAT
             }
         else null
 
-    private val flyWheelLeft = motor(FlywheelLeftMotor, reverse = false)
-    private val flyWheelRight = motor(FlywheelRightMotor, reverse = true)
+    private val flyWheelLeft = motor(FlywheelLeftMotor, hasLeft, FLYWHEEL_LEFT_REVERSED)
+    private val flyWheelRight = motor(FlywheelRightMotor, hasRight, FLYWHEEL_RIGHT_REVERSED)
 
     /** Holds whichever wheels exist at [rpm], clamped to the motor's real top speed. */
     fun spinToRpm(rpm: Double) {
         val target = rpm.coerceIn(0.0, FLYWHEEL_MOTOR_MAX_RPM)
         flyWheelLeft?.setVelocitySetpoint(target.rpm)
         flyWheelRight?.setVelocitySetpoint(target.rpm)
+    }
+
+    /**
+     * Spins ONE wheel at [rpm] and stops the other. Used by the "Flywheel
+     * Direction Test" OpMode to verify each wheel's spin direction on its own
+     * — spinning both at once cannot show which one is reversed.
+     *
+     * @param left true to spin only the left wheel, false for only the right
+     */
+    fun spinOneWheelToRpm(left: Boolean, rpm: Double) {
+        val target = rpm.coerceIn(0.0, FLYWHEEL_MOTOR_MAX_RPM)
+        if (left) {
+            flyWheelLeft?.setVelocitySetpoint(target.rpm)
+            flyWheelRight?.setVelocitySetpoint(0.0.rpm)
+        } else {
+            flyWheelLeft?.setVelocitySetpoint(0.0.rpm)
+            flyWheelRight?.setVelocitySetpoint(target.rpm)
+        }
     }
 
     /** Legacy power-style control: 1.0 = full 6000 RPM, 0 = stopped. */

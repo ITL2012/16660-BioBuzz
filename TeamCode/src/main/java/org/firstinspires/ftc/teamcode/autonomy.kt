@@ -21,6 +21,7 @@ import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 // ============================================================================
 // SECTION 1: PhaseClock — the 30s autonomous budget manager
@@ -77,9 +78,21 @@ class PhaseClock(
  * for ANY distance — the hive AprilTag estimator ([HiveScoring]) supplies X
  * live during matches.
  *
- * Until you fill in real measured distances, [isCalibrated] is false and every
- * query falls back to full speed (the old "spin at 100%" behavior), so the
- * robot is never left unable to shoot.
+ * UNTIL THE CURVE IS MEASURED, a physically reasonable ESTIMATE is used
+ * instead of "always full speed". Firing flat out at every distance is a
+ * real handicap: a 100 cm shot at 6000 RPM overshoots badly, and the robot
+ * cannot score a close hive. The estimate comes from projectile physics —
+ * a flywheel of radius r spinning at omega imparts a surface speed
+ * v = omega * r, and the ball leaves at roughly that speed, so the launch
+ * speed needed for range d at 45 degrees is v = sqrt(d * g), giving
+ *
+ *     omega = sqrt(d * g) / r      =>      RPM = omega * 60 / (2*pi)
+ *
+ * The estimate is deliberately slightly HIGH (a real flywheel transfers
+ * less than 100% of its surface speed to the ball), so the robot
+ * undershoots rather than overshoots — undershooting still scores at close
+ * range, overshooting sails past the hive. Run the calibration OpMode once
+ * there is time and paste the measured numbers over the estimate.
  */
 object ShooterModel {
 
@@ -101,23 +114,46 @@ object ShooterModel {
     /**
      * Farthest distance we can shoot: the calibrated curve's reach, or the
      * HiveScoringConfig fallback window when no calibration data exists yet.
+     *
+     * The fallback is a REALISTIC shooting window, not the physics estimate's
+     * theoretical limit (which is ~17 m, because the estimate ignores launch
+     * losses the real flywheel has). Until the curve is measured, the robot
+     * should only claim it can hit a hive it plausibly can.
      */
     fun effectiveMaxRangeCm(): Double =
         if (isCalibrated()) maxRangeCm() else HiveScoringConfig.SHOOT_MAX_RANGE_CM
 
     /**
+     * Farthest distance the physics ESTIMATE can address (the RPM needed
+     * stays within the flywheel's speed range up to here).
+     *
+     * This is the ceiling of the estimate's usefulness — beyond it the
+     * estimate would ask for more RPM than the motor can make. It is NOT a
+     * claim about real-world reach (see [effectiveMaxRangeCm]).
+     */
+    fun estimatedMaxRangeCm(): Double {
+        val g = 980.0 // cm/s^2
+        val launchSpeed = FLYWHEEL_MOTOR_MAX_RPM * 2.0 * Math.PI / 60.0 *
+            SHOOTER_FLYWHEEL_RADIUS_CM * SHOOTER_TRANSFER_EFFICIENCY
+        return launchSpeed * launchSpeed / g
+    }
+
+    /**
      * Flywheel RPM needed to land the ball [distanceCm] away. Linear
      * interpolation between the nearest calibrated samples; distances outside
      * the calibrated range clamp to the nearest end (too close still uses the
-     * slowest calibrated RPM, too far uses the fastest). Uncalibrated -> 6000.
+     * slowest calibrated RPM, too far uses the fastest).
+     *
+     * With no measured curve yet, falls back to the physics estimate in
+     * [estimatedRpmForDistance] instead of full speed.
      */
     fun rpmForDistance(distanceCm: Double): Double {
         val s = samples()
-        if (s.size < 2) return FLYWHEEL_MOTOR_MAX_RPM
+        if (s.size < 2) return estimatedRpmForDistance(distanceCm)
 
         var lo = s.first()
         var hi = s.last()
-        for (i in 0 until s.size - 1) {
+        for (i in 0 until s.size - 2) {
             if (distanceCm in s[i].second..s[i + 1].second) {
                 lo = s[i]
                 hi = s[i + 1]
@@ -129,6 +165,29 @@ object ShooterModel {
 
         val t = (distanceCm - lo.second) / (hi.second - lo.second)
         return lo.first + t * (hi.first - lo.first)
+    }
+
+    /**
+     * Physics-based estimate of the RPM needed for [distanceCm], used until a
+     * real calibration curve exists.
+     *
+     * A ball squeezed between two flywheels leaves at roughly the flywheel's
+     * surface speed. Launched at 45 degrees, a projectile travels
+     * d = v^2 / g, so the launch speed for range d is v = sqrt(d * g) and
+     * the flywheel must spin at omega = v / r.
+     *
+     * [SHOOTER_FLYWHEEL_RADIUS_CM] is the radius of ONE flywheel (the ball
+     * rides between them, so the effective rolling radius is a little less
+     * than one wheel's radius — [SHOOTER_TRANSFER_EFFICIENCY] accounts for
+     * that and for the slip between wheel and ball).
+     */
+    fun estimatedRpmForDistance(distanceCm: Double): Double {
+        if (distanceCm <= 0.0) return FLYWHEEL_MIN_FIRING_RPM
+        val g = 980.0 // cm/s^2
+        val launchSpeedCmPerSec = sqrt(distanceCm * g)
+        val omegaRadPerSec = launchSpeedCmPerSec / (SHOOTER_FLYWHEEL_RADIUS_CM * SHOOTER_TRANSFER_EFFICIENCY)
+        val rpm = omegaRadPerSec * 60.0 / (2.0 * Math.PI)
+        return rpm.coerceIn(FLYWHEEL_MIN_FIRING_RPM, FLYWHEEL_MOTOR_MAX_RPM)
     }
 
     /** Live summary for telemetry / the Driver Station. */

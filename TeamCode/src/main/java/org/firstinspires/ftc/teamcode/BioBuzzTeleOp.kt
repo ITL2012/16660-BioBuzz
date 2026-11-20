@@ -242,7 +242,7 @@ class BioBuzzTeleOp : LinearOpMode() {
             if (flywheel.anyMotor) {
                 when {
                     manualFire || assistFire -> flywheel.spinToRpm(shootingRpm)
-                    FLYWHEEL_PRIME_ENABLED -> flywheel.ready()
+                    FLYWHEEL_PRIME_ENABLED -> flywheel.prime()
                     else -> flywheel.stop()
                 }
             }

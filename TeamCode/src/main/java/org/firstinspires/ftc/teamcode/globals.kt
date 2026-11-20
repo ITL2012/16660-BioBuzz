@@ -31,12 +31,23 @@ val TrackWidthCm: Double = DrivetrainSpec.TRACK_WIDTH_CM
 // and position control read TRUE wheel/motor speed. VERIFY each CPR against the
 // spec sheet that ships in the goBILDA box before trusting closed-loop tuning.
 
-// -- Drivetrain: 4x 117 RPM (5203-2402-0051), mecanum --
-const val DRIVE_MOTOR_MAX_RPM = 312.0
+// -- Drivetrain: 4x 312 RPM (5203-2402-0019), mecanum --
 // DERIVED from DrivetrainSpec (motor CPR x gearbox ratio) — no hand math.
+val DRIVE_MOTOR_MAX_RPM = DrivetrainSpec.DRIVE_MOTOR_MAX_RPM
 val DRIVE_MOTOR_ENCODER_CPR = DrivetrainSpec.driveTicksPerWheelRev
 
 // -- Flywheel: 2x 6000 RPM (5203-2402-0001), one per side of the ball --
+// The two flywheels squeeze the ball from opposite sides, so they MUST
+// counter-rotate for the ball to be launched straight through. These two
+// constants ARE the flywheel spin direction — flip them to change how the
+// launcher throws (full procedure in README Chapter 10.4):
+//   FLYWHEEL_LEFT_REVERSED  = false  → left wheel spins FORWARD
+//   FLYWHEEL_RIGHT_REVERSED = true   → right wheel spins REVERSE
+// If the ball comes out BACKWARD, flip BOTH. If only one wheel spins the
+// wrong way, flip only that one. If the ball squirts sideways, the two
+// motors are swapped left-for-right in the hub config — swap the names there.
+const val FLYWHEEL_LEFT_REVERSED = false
+const val FLYWHEEL_RIGHT_REVERSED = true
 const val FLYWHEEL_MOTOR_MAX_RPM = 6000.0
 const val FLYWHEEL_MOTOR_ENCODER_CPR = 28.0 // 1:1 gearbox -> 28 CPR at output shaft
 
@@ -54,6 +65,16 @@ val SHOOTER_CALIBRATION_RPM = doubleArrayOf(6000.0, 5000.0, 4000.0, 3000.0, 2000
 var SHOOTER_CALIBRATION_DISTANCE_CM = doubleArrayOf(
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // FILL IN: measured landing distance per RPM (cm)
 )
+
+// ================== SHOOTER PHYSICS (used until the curve is measured) ==================
+// Until SHOOTER_CALIBRATION_DISTANCE_CM has real numbers, ShooterModel
+// estimates the RPM needed for a given distance from projectile physics
+// instead of firing flat out at every range. These three constants are what
+// that estimate needs — measure the flywheel diameter with a ruler and
+// adjust the efficiency factor after a few real shots.
+const val SHOOTER_FLYWHEEL_RADIUS_CM = 3.8   // MEASURE: radius of ONE flywheel
+const val SHOOTER_TRANSFER_EFFICIENCY = 0.55   // fraction of surface speed the ball actually gets
+const val FLYWHEEL_MIN_FIRING_RPM = 1000.0     // never command less than this when firing
 
 // -- Flywheel priming: the 6000 RPM motors are torque-starved (1.47 kg.cm), so
 // spin-up from a dead stop takes a while. Keep the wheels idling at PRIME_RPM
@@ -233,9 +254,9 @@ const val ESCAPE_COOLDOWN_MS = 3000.0         // minimum time between escapes
 // name the motors below in the Driver Hub config. All geometry (positions,
 // angles, reversal flags, ticks per rev, wheel diameter) lives in
 // DrivetrainSpec (drivetrainspec.kt) — measure there, the math happens here.
-const val DEAD_WHEEL_PAR0_NAME = "par0"     // parallel wheel (forward rolling)
-const val DEAD_WHEEL_PAR1_NAME = "par1"     // second parallel wheel
-const val DEAD_WHEEL_PERP_NAME = "perp"     // perpendicular wheel
+const val DEAD_WHEEL_PAR0_NAME = "backleftodo"     // parallel wheel (forward rolling)
+const val DEAD_WHEEL_PAR1_NAME = "backrightodo"     // second parallel wheel
+const val DEAD_WHEEL_PERP_NAME = "frontodo"     // perpendicular wheel
 
 // ================== STRATEGIC PLANNER (lookahead brain) ==================
 const val MATCH_TELEOP_SECONDS = 120.0      // BioBuzz driver-controlled period

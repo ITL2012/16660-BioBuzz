@@ -126,12 +126,21 @@ class HiveScoring(
     private val upIntrinsics = VisionConfig.calibrationFor(cameraId).intrinsics
 
     /**
+     * When false, [update] returns null immediately WITHOUT querying the
+     * AprilTag processor. Set it to true only while the robot actually wants
+     * the hive (the align assist / the ALIGN phase); leaving it on all match
+     * costs a camera-processor scan per loop for a result nobody reads.
+     */
+    var aprilTagEnabled = true
+
+    /**
      * Latest hive target for the SELECTED ALLIANCE ([SELECTED_TEAM], picked
      * during INIT in both match OpModes) — best visible own-hive cluster, else
      * best own single tag, or null. Opposing hive tags/clusters are ignored, so
      * the robot can never line up on (or fire into) the wrong hive.
      */
     fun update(): HiveTarget? {
+        if (!aprilTagEnabled) return null
         val team = SELECTED_TEAM
         val ourClusters = teamClusterNames(team)
         val ourIds = teamTagIds(team).toHashSet()
@@ -271,7 +280,12 @@ class HiveScoring(
     /**
      * Flywheel RPM to land a ball on the target from wherever we stand: the
      * calibrated curve ([ShooterModel]) evaluated at the LIVE tag distance.
-     * Uncalibrated curve or no target -> full speed (the old behavior).
+     *
+     * With no calibration curve yet, [ShooterModel] falls back to a physics
+     * estimate from the launch speed and range (see
+     * [ShooterModel.estimatedRpmForDistance]) instead of firing flat out —
+     * firing full speed at a 100 cm hive would sail past it. With no target
+     * at all there is no distance to estimate from, so it uses full speed.
      */
     fun shootingRpmFor(t: HiveTarget?): Double =
         if (t == null) FLYWHEEL_MOTOR_MAX_RPM
