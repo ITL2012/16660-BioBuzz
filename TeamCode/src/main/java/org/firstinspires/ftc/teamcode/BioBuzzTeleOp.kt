@@ -104,6 +104,9 @@ class BioBuzzTeleOp : LinearOpMode() {
         var fieldCentric = TELEOP_FIELD_CENTRIC_DEFAULT
         var poseHold = TELEOP_POSE_HOLD_DEFAULT
         var stillPose: Pose2d? = null
+        // Anchor target (pose-hold during a push). Kept SEPARATE from stillPose so a
+        // stale anchor position can never recapture idle pose-hold after release.
+        var anchorPose: Pose2d? = null
         var lastLeftStickBtn = false
         var lastRightStickBtn = false
         val intake = Intake(hw.intakeMotor)
@@ -313,13 +316,10 @@ class BioBuzzTeleOp : LinearOpMode() {
             }
 
             // ---- TILT GUARD: cut drive power, not just warn (the legality ----
-            // review describes this reflex as "cuts power") ----
+            // review describes this reflex as "cuts power"). The zeroing is applied
+            // as the FINAL output gate (after anchor/assists/JJ), not here, so that
+            // no mode can reapply drive power while tipping.
             val tipping = tiltGuard.isTipping()
-            if (tipping) {
-                forward = 0.0
-                strafe = 0.0
-                turn = 0.0
-            }
 
             // ===== ANTI-RAMMING / PUSH-RESISTANCE =====
             // If the robot is being shoved (detected via velocity divergence),
@@ -330,9 +330,9 @@ class BioBuzzTeleOp : LinearOpMode() {
             if (pushed || manualAnchor) {
                 locator?.setAnchorManual(manualAnchor)
                 if (locator != null) {
-                    // Hold the pose at the moment push was detected (or now if manual)
-                    if (stillPose == null) stillPose = locator.pose
-                    val err = stillPose!!.minus(locator.pose)
+                    // Hold the pose at the moment push was detected (or now if manual).
+                    if (anchorPose == null) anchorPose = locator.pose
+                    val err = anchorPose!!.minus(locator.pose)
                     val hf = (ANCHOR_KP_POS * err.line.x)
                         .coerceIn(-ANCHOR_MAX_POWER, ANCHOR_MAX_POWER)
                     val hs = (ANCHOR_KP_POS * err.line.y)
@@ -346,6 +346,9 @@ class BioBuzzTeleOp : LinearOpMode() {
                 if (manualAnchor) locator?.setAnchorManual(true)
             } else {
                 locator?.setAnchorManual(false)
+                // Release the anchor target so a stale anchor position cannot
+                // recapture idle pose-hold on a later cycle.
+                anchorPose = null
             }
 
             // ===== ACTIVE DODGE (opponent avoidance) =====
@@ -383,10 +386,16 @@ class BioBuzzTeleOp : LinearOpMode() {
             // Detect when we're pinned (high commanded vel, near-zero measured vel,
             // opponent nearby). Execute: BACKUP -> ROTATE -> RETRY FORWARD.
             if (PIN_DETECTION_ENABLED && locator != null && !tipping) {
-                val commandedSpeed = hypot(forward, strafe)
+                val commandedVel = locator.lastCommandedVelocity
+                val commandedSpeed = if (commandedVel != null) {
+                    hypot(commandedVel.component1().x, commandedVel.component1().y)
+                } else {
+                    0.0
+                }
+                val pinCommandThreshold = 0.2 * DrivetrainSpec.driveFreeSpeedInPerSec
                 val measuredVel = locator.lastMeasuredVelocity
                 val measuredSpeed = if (measuredVel != null) hypot(measuredVel.component1().x, measuredVel.component1().y) else 0.0
-                val velRatio = if (commandedSpeed > 0.2) measuredSpeed / commandedSpeed else 1.0
+                val velRatio = if (commandedSpeed > pinCommandThreshold) measuredSpeed / commandedSpeed else 1.0
 
                 // Opponent nearby check
                 var opponentNear = false
@@ -397,7 +406,7 @@ class BioBuzzTeleOp : LinearOpMode() {
                     }
                 }
 
-                val pinned = commandedSpeed > 0.2 && velRatio < PIN_VEL_RATIO_THRESHOLD && opponentNear
+                val pinned = commandedSpeed > pinCommandThreshold && velRatio < PIN_VEL_RATIO_THRESHOLD && opponentNear
                 val now = System.nanoTime()
 
                 if (pinned) {
@@ -466,8 +475,15 @@ class BioBuzzTeleOp : LinearOpMode() {
 
             // ---- drive ----
             if (useJjDrive) {
-                // JJ driving scheme: raw stick -> driveTeleOp, no assists
-                drivetrain?.driveTeleOp(jjForward, jjStrafe, jjTurn)
+                // JJ driving scheme: raw stick -> driveTeleOp, no assists.
+                // Store the actual output for next cycle's push comparison;
+                // raw mode still cannot drive while tipping.
+                val outForward = if (tipping) 0.0 else jjForward
+                val outStrafe = if (tipping) 0.0 else jjStrafe
+                val outTurn = if (tipping) 0.0 else jjTurn
+                locator?.lastCommandedVelocity =
+                    MecanumDrive.teleopCommandToVelocity(outForward, outStrafe, outTurn)
+                drivetrain?.driveTeleOp(outForward, outStrafe, outTurn)
             } else {
                 // ---- POSE HOLD: sticks released -> hold the last still pose ----
                 if (locator != null && poseHold) {
@@ -491,7 +507,16 @@ class BioBuzzTeleOp : LinearOpMode() {
                         stillPose = null
                     }
                 }
-                drivetrain?.driveTeleOp(forward, strafe, turn)
+                // Tilt/dead safety is the last output gate. The next pose
+                // update compares fresh measured velocity with this actual
+                // output; re-evaluating push here would compare old motion
+                // with a brand-new stick command and create false positives.
+                val outForward = if (tipping) 0.0 else forward
+                val outStrafe = if (tipping) 0.0 else strafe
+                val outTurn = if (tipping) 0.0 else turn
+                locator?.lastCommandedVelocity =
+                    MecanumDrive.teleopCommandToVelocity(outForward, outStrafe, outTurn)
+                drivetrain?.driveTeleOp(outForward, outStrafe, outTurn)
             }
             vision?.periodic()
 

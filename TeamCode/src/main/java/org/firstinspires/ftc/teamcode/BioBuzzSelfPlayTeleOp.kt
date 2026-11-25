@@ -48,7 +48,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
 
     // ---- match state ----
     private var ballsHeld = 0
-    private var closeSinceNanos = 0L
+    private val pickupConfirmation = SelfPlayPickupConfirmation(PICKUP_SETTLE_MS)
+    private val flowerPull = SelfPlayFlowerPull(reverseDurationNanos = 1_000_000_000L)
 
     // loader fire cycle (behavior-based: advances one tick at a time)
     private enum class FireState { IDLE, STROKING, WATCHING, RECOVERING }
@@ -60,8 +61,6 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
     private var commandedRpm = 0.0
     /** nanoTime when RECOVERING began (RECOVERING must never deadlock). */
     private var recoverySinceNanos = 0L
-    /** Planner target id already pulled this flower approach (one-shot latch). */
-    private var flowerPulledId = -1
     private var clockStartRuntime = -1.0
     private var lastDecision: PlannerDecision? = null
     private var lastLoggedDecision: PlannerDecision? = null
@@ -209,6 +208,8 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                 val deadman = gamepad1.left_trigger > 0.5
                 val tipping = tiltGuard?.isTipping() ?: false
                 if (!deadman || tipping) {
+                    pickupConfirmation.resetApproach()
+                    flowerPull.reset()
                     drive.setDrivePowers(PoseVelocity2d(Vector2d(0.0, 0.0), 0.0))
                     intake.stop()
                     flywheel.stop()
@@ -281,9 +282,10 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
         val now = System.nanoTime()
         val hivePos = world.hive()
 
-        // One flower pull per approach: the latch clears as soon as the
-        // planner leaves USE_FLOWER (or targets a different flower).
-        if (d.action != PlannerAction.USE_FLOWER) flowerPulledId = -1
+        // Changing behavior cancels only the current approach, never the
+        // record of tracks that have already been counted.
+        if (d.action != PlannerAction.COLLECT_BALL) pickupConfirmation.resetApproach()
+        if (d.action != PlannerAction.USE_FLOWER) flowerPull.reset()
 
         when (d.action) {
             PlannerAction.COLLECT_BALL -> {
@@ -297,19 +299,21 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
                     // give the pickup a rest: stop intake until the guard resets
                 }
 
-                // Pickup confirmation: a live ball stuck at the intake for
-                // PICKUP_SETTLE_MS counts as collected (same rule as autonomous).
+                // Pickup confirmation is latched to the planner track: one
+                // continuously visible ball can never fill the virtual hopper.
                 val live = ballLocator.nearestBall()
-                if (live != null && live.distanceCm <= PICKUP_CONFIRM_CM) {
-                    if (closeSinceNanos == 0L) {
-                        closeSinceNanos = now
-                    } else if ((now - closeSinceNanos) / 1e6 >= PICKUP_SETTLE_MS) {
-                        ballsHeld = (ballsHeld + 1).coerceAtMost(MAX_BALLS_HELD)
-                        closeSinceNanos = 0L
-                        BlackBox.event("ball_collected", "label" to live.label, "ballsHeld" to ballsHeld)
-                    }
-                } else {
-                    closeSinceNanos = 0L
+                val pickedUp = pickupConfirmation.update(
+                    targetId = d.targetId,
+                    closeEnough = live != null && live.distanceCm <= PICKUP_CONFIRM_CM,
+                    nowNanos = now,
+                )
+                if (pickedUp) {
+                    ballsHeld = (ballsHeld + 1).coerceAtMost(MAX_BALLS_HELD)
+                    world.removeBall(d.targetId)
+                    BlackBox.event(
+                        "ball_collected", "targetId" to d.targetId,
+                        "label" to live?.label, "ballsHeld" to ballsHeld,
+                    )
                 }
             }
 
@@ -358,25 +362,33 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
 
             PlannerAction.USE_FLOWER -> {
                 val live = ballLocator.nearestFlower()
-                if (live != null && live.distanceCm <= FLOWER_APPROACH_CM + 5.0) {
-                    // In range: stop, pull ONCE (latched), then keep swallowing.
-                    // The pull routine may block briefly — it must stay SHORT,
-                    // because the deadman is only polled between ticks.
+                val inRange = live != null && live.distanceCm <= FLOWER_APPROACH_CM + 5.0
+                val pullEvent = flowerPull.update(d.targetId, inRange, now)
+                if (inRange || flowerPull.reversing) {
                     drive.setDrivePowers(PoseVelocity2d(Vector2d(0.0, 0.0), 0.0))
-                    if (d.targetId != flowerPulledId) {
-                        flowerPulledId = d.targetId
-                        flowerPullRoutine(intake, loader)
-                        intake.spinUp(1.0) // swallow the released ball (setpoint persists)
+                } else {
+                    drive.setDrivePowers(steerTo(d.targetFieldXcm, d.targetFieldYcm, px, py, h))
+                }
+
+                when (pullEvent) {
+                    FlowerPullEvent.START_REVERSE -> {
+                        // One tick only: subsequent ticks advance the timer
+                        // without sleeping, so the deadman remains responsive.
+                        intake.spinUp(-1.0)
+                        NextMotor.motorEventLoop.poll()
+                    }
+                    FlowerPullEvent.COMPLETE -> {
+                        intake.spinUp(1.0) // swallow the released ball
                         ballsHeld = (ballsHeld + 1).coerceAtMost(MAX_BALLS_HELD)
                         BlackBox.event(
-                            "flower_pull", "distanceCm" to live.distanceCm,
+                            "flower_pull", "distanceCm" to live?.distanceCm,
                             "ballsHeld" to ballsHeld,
                         )
                     }
-                    // keep the jam watch on while swallowing at the flower
-                    jamGuard?.update(spinning = true)
-                } else {
-                    drive.setDrivePowers(steerTo(d.targetFieldXcm, d.targetFieldYcm, px, py, h))
+                    FlowerPullEvent.NONE -> {}
+                }
+                if (!flowerPull.reversing) {
+                    // Keep the jam watch on while approaching or swallowing.
                     jamGuard?.update(spinning = true)
                 }
             }

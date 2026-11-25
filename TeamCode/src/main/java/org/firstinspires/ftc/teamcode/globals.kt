@@ -17,7 +17,6 @@ const val FlywheelLeftMotor = "flywheelleft"
 const val FlywheelRightMotor = "flywheelright"
 const val IntakeMotor = "intake"
 const val IntakeGearRatio = 1.0
-
 // Drivetrain geometry now DERIVES from the physical measurements in
 // drivetrainspec.kt (DrivetrainSpec) — edit the measurements there, not here.
 val WheelDiameterCm: Double = DrivetrainSpec.DRIVE_WHEEL_DIAMETER_CM

@@ -124,6 +124,7 @@ object BlackBox {
     }
 
     /** Session folder for one camera's frames, or null when inactive. */
+    @Synchronized
     fun framesDirFor(camera: String): File? {
         if (!active) return null
         val dir = sessionDir ?: return null
@@ -137,6 +138,7 @@ object BlackBox {
         active && frameBytesSaved < BLACKBOX_MAX_SESSION_MB * 1024.0 * 1024.0
 
     /** Called by FrameGrabProcessor after a successful JPEG write. */
+    @Synchronized
     fun noteFrame(camera: String, file: String, captureNanos: Long, bytes: Int) {
         frameBytesSaved += bytes
         log("frame" to camera, "file" to file, "captureNanos" to captureNanos)

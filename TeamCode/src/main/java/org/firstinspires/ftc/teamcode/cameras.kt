@@ -140,16 +140,18 @@ class VisionSystem(hardwareMap: HardwareMap) {
                     if (tag.metadata == null) continue
                     // Only OUR alliance's hives count (SELECTED_TEAM, globals.kt).
                     if (tag.id !in teamTagIds(SELECTED_TEAM)) continue
+                    // Uncalibrated cameras can detect a tag without a pose.
+                    val ftc = tag.ftcPose ?: continue
                     highDetections.add(
                         Detection(
                             label = "Hive Tag ${tag.id}",
-                            distanceMm = tag.ftcPose.range * 25.4,
+                            distanceMm = ftc.range * 25.4,
                             // SDK ftc.bearing is + = LEFT; normalize to + = right
                             // to match the blob detections' angle convention.
-                            angleDegrees = -tag.ftcPose.bearing,
-                            xMm = tag.ftcPose.x * 25.4,
-                            yMm = tag.ftcPose.y * 25.4,
-                            zMm = tag.ftcPose.z * 25.4,
+                            angleDegrees = -ftc.bearing,
+                            xMm = ftc.x * 25.4,
+                            yMm = ftc.y * 25.4,
+                            zMm = ftc.z * 25.4,
                             metadata = "ID ${tag.id}",
                             screenX = tag.center.x.toFloat(),
                             screenY = tag.center.y.toFloat()

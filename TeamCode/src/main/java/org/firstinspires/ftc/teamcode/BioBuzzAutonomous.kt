@@ -155,6 +155,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         try {
             // ---- THE SCORE LOOP: keep cycling while a full cycle fits ----
             var cycle = 0
+            val inventory = HopperInventory() // physical hopper inventory, persists across cycles
             var totalScored = 0
             while (opModeIsActive()) {
                 cycle++
@@ -166,27 +167,34 @@ class BioBuzzAutonomous : LinearOpMode() {
 
                 // ---- PHASE 1: COLLECT (planner-driven, memory-backed) ----
                 BlackBox.event("phase", "name" to "1-collect")
+                val maxToCollect = inventory.remainingCapacity()
                 val collected = collectBalls(
                     clock.deadlineNanos(
                         AUTONOMOUS_COLLECT_TIMEOUT_MS,
                         reserveSec = AUTONOMY_PARK_RESERVE_SEC + AUTONOMY_FIRE_RESERVE_SEC,
-                    )
+                    ),
+                    maxToCollect,
+                    inventory.held, // true held count for the planner
                 )
-                BlackBox.event("collect_done", "balls" to collected)
-                telemetry.addData("PHASE 1 done", "$collected / $MAX_BALLS_HELD balls")
+                inventory.addCollected(collected)
+                BlackBox.event("collect_done", "balls" to collected, "held" to inventory.held)
+                telemetry.addData("PHASE 1 done", "${inventory.held} / $MAX_BALLS_HELD balls")
 
                 // ---- PHASE 1b: FLOWER (optional; needs capacity AND time) ----
-                if (FLOWER_PULL_ENABLED && collected < MAX_BALLS_HELD &&
+                if (FLOWER_PULL_ENABLED && !inventory.isFull() &&
                     clock.fits(MIN_CYCLE_REMAINING_SEC + AUTONOMY_FIRE_RESERVE_SEC)
                 ) {
                     telemetry.addLine("PHASE 1b: flower pull")
                     BlackBox.event("phase", "name" to "1b-flower")
-                    useFlowerIfVisible(
+                    if (useFlowerIfVisible(
                         clock.deadlineNanos(
                             FLOWER_PULL_TIMEOUT_MS,
                             reserveSec = AUTONOMY_PARK_RESERVE_SEC + AUTONOMY_FIRE_RESERVE_SEC,
                         )
-                    )
+                    )) {
+                        inventory.addFlower()
+                        BlackBox.event("flower_done", "held" to inventory.held)
+                    }
                 }
 
                 // ---- PHASE 2: POLISH (first cycle only — one-time cleanup) ----
@@ -197,7 +205,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                 }
 
                 // ---- PHASE 3 + 4: ALIGN + FIRE (only with balls to shoot) ----
-                if (collected > 0) {
+                if (!inventory.isEmpty()) {
                     telemetry.addLine("PHASE 3: hive alignment")
                     BlackBox.event("phase", "name" to "3-align")
                     flywheel.spinToRpm(
@@ -212,15 +220,20 @@ class BioBuzzAutonomous : LinearOpMode() {
                     )
 
                     if (aligned) {
-                        val fired = fireBalls(collected)
-                        totalScored += fired
+                        val result = fireBalls(inventory.held)
+                        inventory.eject(result.attempted)
+                        inventory.confirm(result.confirmed)
+                        totalScored = inventory.totalScored
                         BlackBox.event(
                             "cycle_done",
-                            "cycle" to cycle, "fired" to fired, "totalScored" to totalScored,
+                            "cycle" to cycle, "attempted" to result.attempted,
+                            "confirmed" to result.confirmed, "totalScored" to totalScored,
+                            "held" to inventory.held,
                         )
                     } else {
-                        BlackBox.event("fire_skipped", "reason" to "align failed")
-                        telemetry.addData("PHASE 4", "ALIGN FAILED - skipping fire (safe)")
+                        // Align failed: physical inventory is PRESERVED for the next cycle.
+                        BlackBox.event("fire_skipped", "reason" to "align failed", "held" to inventory.held)
+                        telemetry.addData("PHASE 4", "ALIGN FAILED - skipping fire (safe), ${inventory.held} balls held")
                         telemetry.update()
                     }
                     flywheel.stop()
@@ -318,7 +331,32 @@ class BioBuzzAutonomous : LinearOpMode() {
      *      old blind forward creep.
      * Bounded by AUTONOMOUS_COLLECT_TIMEOUT_MS.
      */
-    private fun collectBalls(deadlineNanos: Long): Int {
+    /**
+     * PHASE 1 core: collection driven by this branch's own decision stack.
+     * Each loop:
+     *   1. report() fuses this frame's sightings into the WorldModel,
+     *   2. the StrategicPlanner picks the action. COLLECT_BALL commits to a
+     *      remembered TRACK — a challenger must win TARGET_SWITCH_CONFIRM_LOOPS
+     *      consecutive picks to unseat it, which kills target dithering;
+     *      GO_SCORE / USE_FLOWER / PARK exit the phase early so the phase
+     *      machine can act on the strategy immediately,
+     *   3. dodge opponent robots sitting in the pursuit corridor,
+     *   4. pursue the track's FIELD position — dead-reckoned on the fused
+     *      pose when the ball has left the FOV — with a turn-toward-ball
+     *      term so wide bearings rotate the intake onto the ball,
+     *   5. confirm pickup by proximity-settle, then removeBall() so the
+     *      map never re-chases a collected ball,
+     *   6. nothing worth doing (HOLD): sweep-search in place instead of the
+     *      old blind forward creep.
+     * Bounded by AUTONOMOUS_COLLECT_TIMEOUT_MS.
+     *
+     * @param maxToCollect remaining hopper capacity — collection stops here so
+     *                     the hopper is never over-filled.
+     * @param alreadyHeld  true physical inventory carried over from previous
+     *                     cycles; fed to the planner (as alreadyHeld + collected)
+     *                     so it reasons about the real held count.
+     */
+    private fun collectBalls(deadlineNanos: Long, maxToCollect: Int, alreadyHeld: Int): Int {
         var collected = 0
         var committedId: Int? = null
         var challengerId: Int? = null
@@ -332,7 +370,7 @@ class BioBuzzAutonomous : LinearOpMode() {
         // The jam guard OWNS the intake during collection (full speed, coughs
         // on jams, brakes hard when fully jammed) — a jam can no longer stall
         // the phase silently.
-        while (opModeIsActive() && collected < MAX_BALLS_HELD && System.nanoTime() < deadlineNanos) {
+        while (opModeIsActive() && collected < maxToCollect && System.nanoTime() < deadlineNanos) {
             NextMotor.motorEventLoop.poll()
             drive.updatePoseEstimate()
             vision.updateRoadRunnerPose(drive.pose)
@@ -356,7 +394,7 @@ class BioBuzzAutonomous : LinearOpMode() {
             val matchRemainingSec = clock.remainingSec()
 
             // ---- 2. planner decision ----
-            val decision = planner.decide(world, collected, matchRemainingSec, px, py)
+            val decision = planner.decide(world, alreadyHeld + collected, matchRemainingSec, px, py)
             when (decision.action) {
                 PlannerAction.GO_SCORE, PlannerAction.USE_FLOWER, PlannerAction.PARK -> {
                     // Leave collection to the phase machine (flower / align / fire / park).
@@ -379,6 +417,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                 if (current == null) {
                     committedId = decision.targetId
                     challengerId = null; challengerWins = 0
+                    closeSinceNanos = 0L // fresh commitment: no settle time carried over
                 } else if (decision.targetId != committedId) {
                     if (challengerId == decision.targetId) challengerWins++ else challengerWins = 1
                     challengerId = decision.targetId
@@ -389,6 +428,7 @@ class BioBuzzAutonomous : LinearOpMode() {
                         )
                         committedId = decision.targetId
                         challengerId = null; challengerWins = 0
+                        closeSinceNanos = 0L // settle time cannot transfer between balls
                     }
                 } else {
                     challengerId = null; challengerWins = 0
@@ -680,14 +720,37 @@ class BioBuzzAutonomous : LinearOpMode() {
      * PHASE 4 core: fire every held ball — one LOADER stroke per ball,
      * CONFIRMED by the flywheel RPM dip, wheels re-verified at speed between
      * balls (the intake does NOT run; the loader meters balls from the
-     * hopper). Bounded by the clock's fire reserve. Returns balls fired.
+     * hopper). Bounded by the clock's fire reserve.
+     *
+     * Never fires at max RPM on a vanished target: aborts safely (log +
+     * telemetry) when no valid aligned target is available at firing time.
+     * Returns loader-ejected [attempted] vs confirmed [confirmed] shots.
      */
-    private fun fireBalls(ballCount: Int): Int {
+    private data class FireResult(val attempted: Int, val confirmed: Int)
+
+    private fun fireBalls(ballCount: Int): FireResult {
         BlackBox.event("phase", "name" to "4-fire")
         val fireTarget = hive.update()
+        // Never blind-fire: if the target vanished after alignment (or we are
+        // not in the ALIGNED zone), abort before spinning up. With no target
+        // there is no distance to estimate RPM from, and shootingRpmFor(null)
+        // would fall back to FLYWHEEL_MOTOR_MAX_RPM — launching balls we can't
+        // account for.
+        if (fireTarget == null || hive.zoneOf(fireTarget) != ScoringZone.ALIGNED) {
+            BlackBox.event(
+                "fire_aborted",
+                "reason" to "no aligned target",
+                "target" to (fireTarget?.label ?: "null"),
+                "distanceCm" to fireTarget?.distanceCm,
+                "bearingDeg" to fireTarget?.bearingDeg,
+            )
+            telemetry.addData("PHASE 4", "ABORT FIRE — no valid aligned target")
+            telemetry.update()
+            return FireResult(0, 0)
+        }
         val rpm = ShotPredictor.adjustRpm(
             hive.shootingRpmFor(fireTarget),
-            fireTarget?.distanceCm ?: 0.0,
+            fireTarget.distanceCm,
             "auto",
         )
         flywheel.spinToRpm(rpm)
@@ -715,18 +778,19 @@ class BioBuzzAutonomous : LinearOpMode() {
             BlackBox.event("fire_aborted", "rpm" to rpm, "reason" to "wheels not at speed")
             telemetry.addData("PHASE 4", "SKIP FIRE — wheels never reached %.0f RPM".format(rpm))
             telemetry.update()
-            return 0
+            return FireResult(0, 0)
         }
 
         telemetry.addData("PHASE 4", "FIRING at %.0f RPM".format(rpm))
         telemetry.update()
         val detector = ShotDetector(flywheel)
-        var fired = 0
+        var attempted = 0
+        var confirmed = 0
         var stroking = false
         var armed = false
         val fireDeadline = System.nanoTime() +
             (clock.remainingSec().coerceAtMost(AUTONOMY_FIRE_RESERVE_SEC) * 1e9).toLong()
-        while (fired < ballCount && opModeIsActive() && System.nanoTime() < fireDeadline) {
+        while (attempted < ballCount && opModeIsActive() && System.nanoTime() < fireDeadline) {
             when {
                 stroking && loader.busy -> report()
                 stroking && !armed -> {
@@ -734,12 +798,29 @@ class BioBuzzAutonomous : LinearOpMode() {
                     armed = true
                 }
                 armed -> when (detector.update()) {
-                    ShotDetector.State.CONFIRMED, ShotDetector.State.MISSED -> {
-                        fired++
+                    ShotDetector.State.CONFIRMED -> {
+                        attempted++
+                        confirmed++
                         stroking = false
                         armed = false
                         loader.retract()
                         // let the wheels recover before the next ball
+                        val recoverBy = System.nanoTime() +
+                            (SHOT_RECOVERY_TIMEOUT_MS * 1e6).toLong()
+                        while (opModeIsActive() && !flywheel.isAtSpeed(rpm) &&
+                            System.nanoTime() < recoverBy
+                        ) {
+                            report()
+                        }
+                    }
+                    ShotDetector.State.MISSED -> {
+                        // Ball left the loader but the RPM dip says it did not
+                        // score: count the attempt (inventory drops), but do NOT
+                        // count it as scored.
+                        attempted++
+                        stroking = false
+                        armed = false
+                        loader.retract()
                         val recoverBy = System.nanoTime() +
                             (SHOT_RECOVERY_TIMEOUT_MS * 1e6).toLong()
                         while (opModeIsActive() && !flywheel.isAtSpeed(rpm) &&
@@ -758,8 +839,9 @@ class BioBuzzAutonomous : LinearOpMode() {
                 else -> report()
             }
         }
-        BlackBox.event("fire_done", "rpm" to rpm, "fired" to fired, "attempted" to ballCount)
-        return fired
+        BlackBox.event("fire_done", "rpm" to rpm, "attempted" to attempted, "confirmed" to confirmed,
+            "requested" to ballCount)
+        return FireResult(attempted, confirmed)
     }
 
     /** Combined telemetry: hive range/angle, RR (fused) pose, vision health. */

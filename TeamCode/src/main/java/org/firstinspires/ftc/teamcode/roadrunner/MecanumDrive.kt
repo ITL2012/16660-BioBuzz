@@ -343,6 +343,8 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         private var lastRightBackPos = 0
         private var lastRightFrontPos = 0
         private var lastHeading = Rotation2d.exp(0.0)
+        /** Wall-clock seconds of the last [update] call, for measured-dt integration. */
+        private var lastUpdateSeconds: Double = -1.0
         private var initialized = false
         private var pose = initialPose
 
@@ -384,37 +386,25 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
                 headingDelta = heading.minus(lastHeading)
                 lastHeading = heading
             } else {
-                // DEGRADED PATH: integrate heading from mecanum kinematics omega
+                // DEGRADED PATH: integrate heading from mecanum kinematics omega.
+                // Use MEASURED elapsed time (not a fixed 1/50 s) so the integrated
+                // heading stays correct regardless of loop rate.
                 heading = lastHeading
+                val nowSec = now()
+                val dt = if (lastUpdateSeconds < 0.0) 0.0 else nowSec - lastUpdateSeconds
+                lastUpdateSeconds = nowSec
 
                 val kinematics = MecanumKinematics(
                     PARAMS.inPerTick, PARAMS.lateralInPerTick, PARAMS.trackWidthTicks
                 )
+                // Velocity-only computation: zero position increment, derivative =
+                // measured wheel speed. (DualNum(v, v) made the derivative carry a
+                // bogus position component and zeroed out the reported angular rate.)
                 val wheelIncrements = MecanumKinematics.WheelIncrements(
-                    DualNum<Time>(
-                        doubleArrayOf(
-                            (leftFrontPosVel.velocity ?: 0).toDouble(),
-                            (leftFrontPosVel.velocity ?: 0).toDouble(),
-                        )
-                    ).times(PARAMS.inPerTick),
-                    DualNum<Time>(
-                        doubleArrayOf(
-                            (leftBackPosVel.velocity ?: 0).toDouble(),
-                            (leftBackPosVel.velocity ?: 0).toDouble(),
-                        )
-                    ).times(PARAMS.inPerTick),
-                    DualNum<Time>(
-                        doubleArrayOf(
-                            (rightBackPosVel.velocity ?: 0).toDouble(),
-                            (rightBackPosVel.velocity ?: 0).toDouble(),
-                        )
-                    ).times(PARAMS.inPerTick),
-                    DualNum<Time>(
-                        doubleArrayOf(
-                            (rightFrontPosVel.velocity ?: 0).toDouble(),
-                            (rightFrontPosVel.velocity ?: 0).toDouble(),
-                        )
-                    ).times(PARAMS.inPerTick),
+                    DualNum<Time>(doubleArrayOf(0.0, (leftFrontPosVel.velocity ?: 0).toDouble())).times(PARAMS.inPerTick),
+                    DualNum<Time>(doubleArrayOf(0.0, (leftBackPosVel.velocity ?: 0).toDouble())).times(PARAMS.inPerTick),
+                    DualNum<Time>(doubleArrayOf(0.0, (rightBackPosVel.velocity ?: 0).toDouble())).times(PARAMS.inPerTick),
+                    DualNum<Time>(doubleArrayOf(0.0, (rightFrontPosVel.velocity ?: 0).toDouble())).times(PARAMS.inPerTick),
                 )
                 val twist = kinematics.forward(wheelIncrements)
                 val vel: PoseVelocity2d = twist.velocity().value()
@@ -433,7 +423,9 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
                     lastRightFrontPos = rightFrontPosVel.position
                     return PoseVelocity2d(Vector2d(0.0, 0.0), 0.0)
                 }
-                headingDelta = omega * (1.0 / 50.0)
+                // Guard against invalid / non-positive dt (clock going backwards,
+                // two calls on the same tick): do not integrate heading at all.
+                headingDelta = if (dt > 0.0) omega * dt else 0.0
             }
 
             val twist: Twist2dDual<Time> = kinematics.forward(
@@ -506,6 +498,8 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
 
         private var lastPos = IntArray(3)
         private var lastHeading = Rotation2d.exp(0.0)
+        /** Wall-clock seconds of the last [update] call, for measured-dt integration. */
+        private var lastUpdateSeconds: Double = -1.0
         private var initialized = false
         private var pose = initialPose
 
@@ -550,9 +544,12 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
                 headingDelta = heading.minus(lastHeading)
                 lastHeading = heading
             } else {
-                // DEGRADED PATH: integrate heading from dead-wheel omega
+                // DEGRADED PATH: integrate heading from dead-wheel omega using
+                // MEASURED elapsed time (not a fixed 1/50 s).
                 heading = lastHeading
-                headingDelta = omega * (1.0 / 50.0) // assume 50Hz loop; omega is rad/s
+                val nowSec = now()
+                val dt = if (lastUpdateSeconds < 0.0) 0.0 else nowSec - lastUpdateSeconds
+                lastUpdateSeconds = nowSec
 
                 FlightRecorder.write(
                     "DEADWHEEL_LOCALIZER_INPUTS_DEGRADED",
@@ -564,6 +561,8 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
                     for (i in 0..2) lastPos[i] = pv[i].position
                     return PoseVelocity2d(Vector2d(0.0, 0.0), 0.0)
                 }
+                // Guard against invalid / non-positive dt.
+                headingDelta = if (dt > 0.0) omega * dt else 0.0
             }
 
             // position increment: least squares for (dx, dy) with heading delta
@@ -950,6 +949,32 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         @JvmStatic
         fun driveEncoderDirection(motorReversed: Boolean): DcMotorSimple.Direction =
             if (motorReversed) DcMotorSimple.Direction.REVERSE else DcMotorSimple.Direction.FORWARD
+
+        /**
+         * Converts a TeleOp driver command (normalized [-1, 1] sticks) into a Road
+         * Runner [PoseVelocity2d] in the SAME physical units as [lastMeasuredVelocity]
+         * (inches/sec and radians/sec), so push detection can compare apples to apples.
+         *
+         * Conventions:
+         *   * +forward   -> +x (forward)
+         *   * +strafe    (teleop + = RIGHT) -> -y, because RR +y is LEFT
+         *   * +turn      (teleop + = CLOCKWISE) -> -angular, because RR +angular is CCW
+         *   * full-scale forward = [DrivetrainSpec.driveFreeSpeedInPerSec] inches/sec,
+         *     derived from [DrivetrainSpec.DRIVE_MOTOR_MAX_RPM] and the wheel diameter.
+         *   * full-scale turn    = v_free / turnRadius radians/sec.
+         *
+         * Never compare normalized stick commands directly with physical velocities.
+         */
+        @JvmStatic
+        fun teleopCommandToVelocity(forward: Double, strafe: Double, turn: Double): PoseVelocity2d {
+            val maxSpeed = DrivetrainSpec.driveFreeSpeedInPerSec
+            val turnRadiusIn = DrivetrainSpec.turnRadiusCm() / 2.54
+            val maxOmega = if (turnRadiusIn > 0.0) maxSpeed / turnRadiusIn else 0.0
+            return PoseVelocity2d(
+                Vector2d(forward * maxSpeed, -strafe * maxSpeed),
+                -turn * maxOmega,
+            )
+        }
     }
 }
 
