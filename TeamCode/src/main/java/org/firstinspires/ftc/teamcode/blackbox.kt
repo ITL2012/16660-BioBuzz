@@ -180,49 +180,117 @@ object BlackBox {
  * (captureNanos) match the state.jsonl lines, so a computer can replay what
  * the robot "was thinking" frame by frame.
  *
- * Cost control: FRAME_CAPTURE_FPS per camera (default 5) and the session MB
- * budget in globals.kt. Runs on the vision thread and swallows its own errors
- * so it can never stall image processing.
+ * Cost control: BLACKBOX_FRAME_CAPTURE_FPS per camera (default 5) and the session
+ * MB budget in globals.kt. A bounded worker per camera owns JPEG encoding and
+ * disk I/O; if it falls behind, capture frames are dropped instead of blocking
+ * the vision thread.
  */
-class FrameGrabProcessor(private val camera: String) : VisionProcessor {
+class FrameGrabProcessor(private val camera: String) : VisionProcessor, AutoCloseable {
 
     @Volatile
     var enabled = true
 
     private var lastSaveNanos = 0L
     private var frameCount = 0
+    private val queueLock = Object()
+    private var pending: Capture? = null
+    private var recycledFrame: Mat? = null
+    private var worker: Thread? = null
 
-    override fun init(width: Int, height: Int, calibration: CameraCalibration?) {}
+    @Volatile
+    private var closed = false
+
+    private data class Capture(
+        val rgba: Mat,
+        val dir: File,
+        val name: String,
+        val captureNanos: Long,
+    )
+
+    override fun init(width: Int, height: Int, calibration: CameraCalibration?) {
+        if (worker == null) {
+            worker = Thread({ writeLoop() }, "BlackBox-$camera-JPEG").apply {
+                isDaemon = true
+                start()
+            }
+        }
+    }
 
     override fun processFrame(frame: Mat?, captureTimeNanos: Long): Any? {
         val f = frame ?: return null
-        if (!enabled || !BlackBox.active) return null
+        if (closed || !enabled || !BlackBox.active) return null
         val intervalNanos = (1e9 / BLACKBOX_FRAME_CAPTURE_FPS).toLong()
         if (captureTimeNanos - lastSaveNanos < intervalNanos) return null
+        synchronized(queueLock) {
+            if (pending != null) return null
+        }
         val dir = BlackBox.framesDirFor(camera) ?: return null
         if (!BlackBox.frameBudgetAvailable()) return null
 
-        lastSaveNanos = captureTimeNanos
-        var bgr: Mat? = null
-        return try {
-            val name = "frame_%06d.jpg".format(++frameCount)
-            val out = File(dir, name)
-            // VisionProcessor frames are 4-channel RGBA; imwrite would treat
-            // them as BGRA and silently save R/B-SWAPPED JPEGs (poisoning the
-            // offline HSV auto-labeling). Convert to BGR first, and only count
-            // the frame against the budget when the write actually succeeded.
-            val bgrMat = Mat()
-            Imgproc.cvtColor(f, bgrMat, Imgproc.COLOR_RGBA2BGR)
-            bgr = bgrMat
-            if (Imgcodecs.imwrite(out.absolutePath, bgrMat)) {
-                BlackBox.noteFrame(camera, name, captureTimeNanos, out.length().toInt())
+        synchronized(queueLock) {
+            if (closed || pending != null) return null
+            val copy = recycledFrame?.also { recycledFrame = null } ?: Mat()
+            try {
+                f.copyTo(copy)
+            } catch (_: Exception) {
+                copy.release()
+                return null
             }
-            null
-        } catch (_: Exception) {
-            null
-        } finally {
-            bgr?.release()
+            pending = Capture(copy, dir, "frame_%06d.jpg".format(++frameCount), captureTimeNanos)
+            lastSaveNanos = captureTimeNanos
+            queueLock.notifyAll()
         }
+        return null
+    }
+
+    private fun writeLoop() {
+        while (true) {
+            val capture = synchronized(queueLock) {
+                while (pending == null && !closed) queueLock.wait()
+                if (closed) return@synchronized null
+                pending.also { pending = null }
+            } ?: break
+
+            var bgr: Mat? = null
+            try {
+                val bgrMat = Mat()
+                bgr = bgrMat
+                Imgproc.cvtColor(capture.rgba, bgrMat, Imgproc.COLOR_RGBA2BGR)
+                val out = File(capture.dir, capture.name)
+                if (Imgcodecs.imwrite(out.absolutePath, bgrMat)) {
+                    BlackBox.noteFrame(camera, capture.name, capture.captureNanos, out.length().toInt())
+                }
+            } catch (_: Exception) {
+            } finally {
+                bgr?.release()
+                recycle(capture.rgba)
+            }
+        }
+    }
+
+    private fun recycle(frame: Mat) {
+        synchronized(queueLock) {
+            if (!closed && recycledFrame == null) {
+                recycledFrame = frame
+                return
+            }
+        }
+        frame.release()
+    }
+
+    override fun close() {
+        val thread = synchronized(queueLock) {
+            if (closed) return@synchronized null
+            closed = true
+            pending?.rgba?.release()
+            pending = null
+            recycledFrame?.release()
+            recycledFrame = null
+            queueLock.notifyAll()
+            worker
+        }
+        thread?.join(2000)
+        worker = null
     }
 
     override fun onDrawFrame(

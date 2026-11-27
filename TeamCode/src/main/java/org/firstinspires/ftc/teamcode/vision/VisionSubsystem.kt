@@ -48,10 +48,14 @@ import kotlin.math.sin
  * headingTrust — heading is depth-free (usable from any mount angle), while
  * translation trust depends on the constant-depth assumption holding.
  */
-class HybridPoseEstimator(
-    private val upProcessor: VisionCameraProcessor,
-    private val frontProcessor: VisionCameraProcessor,
+class HybridPoseEstimator internal constructor(
+    private val upObservation: () -> CameraObservation?,
+    private val frontObservation: () -> CameraObservation?,
 ) : PoseCorrector {
+    constructor(
+        upProcessor: VisionCameraProcessor,
+        frontProcessor: VisionCameraProcessor,
+    ) : this(upProcessor::latestObservation, frontProcessor::latestObservation)
 
     private val snapshotRef = AtomicReference<VisionSnapshot?>(null)
 
@@ -60,6 +64,7 @@ class HybridPoseEstimator(
     private var stateEnteredNanos = 0L
     private var lastSwitchNanos = 0L
     private var lastGoodVisionNanos = 0L
+    private var usableVisionSinceNanos = 0L
 
     // ---- Visual pose dead reckoning ----
     private var visualPose = Pose2d(0.0, 0.0, 0.0)
@@ -88,8 +93,8 @@ class HybridPoseEstimator(
      * visual estimate after sustained vision loss.
      */
     fun update(nowNanos: Long, rrPose: Pose2d) {
-        val up = fresh(upProcessor.latestObservation(), nowNanos)
-        val front = fresh(frontProcessor.latestObservation(), nowNanos)
+        val up = fresh(upObservation(), nowNanos)
+        val front = fresh(frontObservation(), nowNanos)
 
         val upConf = up?.confidence ?: 0.0
         val frontConf = front?.confidence ?: 0.0
@@ -207,6 +212,12 @@ class HybridPoseEstimator(
         val dwellOk = msBetween(lastSwitchNanos, nowNanos) >= VisionTuning.STATE_DWELL_MS
 
         val usableVision = overallConfidence >= VisionTuning.FUSION_MIN_CONFIDENCE
+        if (usableVision) {
+            if (usableVisionSinceNanos == 0L) usableVisionSinceNanos = nowNanos
+        } else {
+            usableVisionSinceNanos = 0L
+        }
+        val recoveredForMs = if (usableVision) msBetween(usableVisionSinceNanos, nowNanos) else 0.0
         val lostForMs = if (usableVision) 0.0 else msBetween(lastGoodVisionNanos, nowNanos)
 
         if (!dwellOk) return
@@ -231,7 +242,7 @@ class HybridPoseEstimator(
                 else -> state
             }
             VisionState.LOST -> when {
-                usableVision && msBetween(lastGoodVisionNanos, nowNanos) >= VisionTuning.STATE_RECOVER_MS -> VisionState.RECOVERING
+                recoveredForMs >= VisionTuning.STATE_RECOVER_MS -> VisionState.RECOVERING
                 else -> state
             }
             VisionState.RECOVERING -> when {
@@ -368,16 +379,12 @@ class HybridPoseEstimator(
  */
 class VisionSubsystem(
     hardwareMap: HardwareMap,
-    extraUpProcessors: List<VisionProcessor> = emptyList(),
-    extraFrontProcessors: List<VisionProcessor> = emptyList(),
+    private val extraUpProcessors: List<VisionProcessor> = emptyList(),
+    private val extraFrontProcessors: List<VisionProcessor> = emptyList(),
 ) : Mechanism {
 
     val upProcessor = VisionCameraProcessor(CameraId.UP)
     val frontProcessor = VisionCameraProcessor(CameraId.FRONT)
-
-    // Frame grabbers (one per camera) — optional, controlled by FRAME_CAPTURE_ENABLED
-    val upFrameGrabber = FrameGrabProcessor("up_camera")
-    val frontFrameGrabber = FrameGrabProcessor("front_camera")
 
     /** The two cameras are two observation sources for ONE pose estimate. */
     val fusion = HybridPoseEstimator(upProcessor, frontProcessor)
@@ -416,7 +423,7 @@ class VisionSubsystem(
                 .setCamera(hardwareMap.get(WebcamName::class.java, UP_CAM_NAME))
                 .setCameraResolution(Size(VisionTuning.UP_CAM_WIDTH, VisionTuning.UP_CAM_HEIGHT))
                 .setLiveViewContainerId(portalViewIds[0])
-                .addProcessors(upProcessor, upFrameGrabber, *extraUpProcessors.toTypedArray())
+                .addProcessors(upProcessor, *extraUpProcessors.toTypedArray())
                 .build()
         } else {
             null
@@ -430,7 +437,6 @@ class VisionSubsystem(
                 .setLiveViewContainerId(portalViewIds[1])
                 .addProcessors(
                     frontProcessor,
-                    frontFrameGrabber,
                     *extraFrontProcessors.toTypedArray(),
                     // Single-camera mode: the surviving front camera also
                     // carries the UP camera's processors (AprilTags, overlays).
@@ -544,6 +550,11 @@ class VisionSubsystem(
     fun close() {
         upPortal?.close()
         frontPortal?.close()
+        upProcessor.close()
+        frontProcessor.close()
+        for (processor in extraUpProcessors + extraFrontProcessors) {
+            (processor as? AutoCloseable)?.close()
+        }
     }
 
     private fun cameraExists(hardwareMap: HardwareMap, name: String): Boolean =

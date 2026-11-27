@@ -216,6 +216,15 @@ class CalibrationFreeDefaultsTest {
     }
 
     @Test
+    fun `calibrated shooter interpolates the final adjacent segment`() {
+        val samples = listOf(1000.0 to 100.0, 2000.0 to 200.0, 3000.0 to 400.0)
+
+        val rpm = ShooterModel.interpolateCalibrated(samples, 300.0)
+
+        assertEquals(2500.0, rpm, 1e-9)
+    }
+
+    @Test
     fun `zero distance does not divide by zero`() {
         val rpm = ShooterModel.rpmForDistance(0.0)
         assertTrue(rpm.isFinite())

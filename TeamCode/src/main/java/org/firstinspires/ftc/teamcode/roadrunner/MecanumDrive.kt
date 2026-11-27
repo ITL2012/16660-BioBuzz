@@ -495,6 +495,9 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
         private val inPerTick = DrivetrainSpec.deadWheelInPerTick
         private val wheels = DrivetrainSpec.deadWheelsIn()
         private val reversed = DrivetrainSpec.deadWheelReversed()
+        private val wheelKinematics = DeadWheelMath.Kinematics(wheels)
+        private val measuredVelocity = DoubleArray(3)
+        private val measuredPosition = DoubleArray(3)
 
         private var lastPos = IntArray(3)
         private var lastHeading = Rotation2d.exp(0.0)
@@ -517,10 +520,11 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
             )
 
             // Velocity from 3-wheel kinematics (works with or without IMU)
-            val measuredVel = List(3) { i ->
-                DeadWheelMath.signed((pv[i].velocity ?: 0).toDouble() * inPerTick, reversed[i])
+            for (i in 0..2) {
+                measuredVelocity[i] =
+                    DeadWheelMath.signed((pv[i].velocity ?: 0).toDouble() * inPerTick, reversed[i])
             }
-            val (vx, vy, omega) = DeadWheelMath.velocity(wheels, measuredVel)
+            val (vx, vy, omega) = wheelKinematics.velocity(measuredVelocity)
 
             var heading: Rotation2d
             var headingDelta: Double
@@ -566,10 +570,11 @@ class MecanumDrive(hardwareMap: HardwareMap, initialPose: Pose2d) {
             }
 
             // position increment: least squares for (dx, dy) with heading delta
-            val measured = List(3) { i ->
-                DeadWheelMath.signed((pv[i].position - lastPos[i]) * inPerTick, reversed[i])
+            for (i in 0..2) {
+                measuredPosition[i] =
+                    DeadWheelMath.signed((pv[i].position - lastPos[i]) * inPerTick, reversed[i])
             }
-            val (dx, dy) = DeadWheelMath.positionDelta(wheels, measured, headingDelta)
+            val (dx, dy) = wheelKinematics.positionDelta(measuredPosition, headingDelta)
 
             for (i in 0..2) lastPos[i] = pv[i].position
             lastHeading = heading

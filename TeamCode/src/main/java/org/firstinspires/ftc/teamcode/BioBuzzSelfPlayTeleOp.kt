@@ -169,7 +169,6 @@ class BioBuzzSelfPlayTeleOp : LinearOpMode() {
 
                 drive.updatePoseEstimate()
                 vision.updateRoadRunnerPose(drive.pose)
-                vision.periodic()
 
                 val pose = drive.pose
                 val px = toCm(pose.position.x)

@@ -144,8 +144,7 @@ class OpticalFlowTracker(
         val prev = prevGray
         if (prev == null || prev.size() != gray.size() || tracks.isEmpty()) {
             reacquire(gray, fullReplace = prev == null || prev.size() != gray.size())
-            prevGray?.release()
-            prevGray = gray.clone()
+            storeGray(gray)
             return FrameResult(DoubleArray(0), DoubleArray(0), 0, 0.0, tracks.size)
         }
 
@@ -198,9 +197,11 @@ class OpticalFlowTracker(
 
         // Keep survivors; retire stale ones unless they are proven static-scene anchors
         tracks.clear()
-        tracks.addAll(survivors.filter {
-            it.ageFrames < VisionTuning.LK_MAX_FEATURE_AGE_FRAMES || it.isStaticInlier
-        })
+        for (t in survivors) {
+            if (t.ageFrames < VisionTuning.LK_MAX_FEATURE_AGE_FRAMES || t.isStaticInlier) {
+                tracks.add(t)
+            }
+        }
 
         // ---- 2. Periodic reacquisition of fresh features ----
         var detections = 0
@@ -217,28 +218,31 @@ class OpticalFlowTracker(
         // zero-motion "votes" that a no-motion RANSAC hypothesis trivially
         // accepts, skewing the scene-motion estimate toward zero.
         val n = tracks.size // total live tracks (confidence uses this)
-        val prevXy = ArrayList<Double>(tracks.size * 2)
-        val curXy = ArrayList<Double>(tracks.size * 2)
-        val trackIndices = ArrayList<Int>(tracks.size)
+        val prevXy = DoubleArray(tracks.size * 2)
+        val curXy = DoubleArray(tracks.size * 2)
+        val trackIndices = IntArray(tracks.size)
+        var correspondenceCount = 0
         for (i in tracks.indices) {
             val t = tracks[i]
             if (t.isNew) continue
-            trackIndices.add(i)
-            prevXy.add(t.prevX)
-            prevXy.add(t.prevY)
-            curXy.add(t.x)
-            curXy.add(t.y)
+            val out = correspondenceCount * 2
+            trackIndices[correspondenceCount] = i
+            prevXy[out] = t.prevX
+            prevXy[out + 1] = t.prevY
+            curXy[out] = t.x
+            curXy[out + 1] = t.y
+            correspondenceCount++
         }
 
-        prevGray?.release()
-        prevGray = gray.clone()
+        storeGray(gray)
 
         return FrameResult(
-            prevXy.toDoubleArray(), curXy.toDoubleArray(),
+            prevXy.copyOf(correspondenceCount * 2),
+            curXy.copyOf(correspondenceCount * 2),
             trackedCount = n,
             meanErrorPx = if (errorCount > 0) errorSum / errorCount else 0.0,
             detectionsThisFrame = detections,
-            trackIndices = trackIndices.toIntArray(),
+            trackIndices = trackIndices.copyOf(correspondenceCount),
         )
     }
 
@@ -248,13 +252,14 @@ class OpticalFlowTracker(
      * the same [FrameResult]) map them back onto track-list positions.
      */
     fun applyRansacResult(inlierIndices: IntArray, trackIndices: IntArray) {
-        val inliers = HashSet<Int>()
+        val inliers = BooleanArray(tracks.size)
         for (k in inlierIndices) {
-            trackIndices.getOrNull(k)?.let { inliers.add(it) }
+            val trackIndex = trackIndices.getOrNull(k) ?: continue
+            if (trackIndex in inliers.indices) inliers[trackIndex] = true
         }
         for (i in tracks.indices) {
             val t = tracks[i]
-            t.isStaticInlier = i in inliers
+            t.isStaticInlier = inliers[i]
             val reward = if (t.isStaticInlier) 1.0 else 0.0
             t.staticConsistency = 0.9 * t.staticConsistency + 0.1 * reward
         }
@@ -291,6 +296,18 @@ class OpticalFlowTracker(
     fun reset() {
         tracks.clear()
         framesSinceDetect = Int.MAX_VALUE
+        prevGray?.release()
+        prevGray = null
+    }
+
+    private fun storeGray(gray: Mat) {
+        val previous = prevGray
+        if (previous == null || previous.size() != gray.size() || previous.type() != gray.type()) {
+            prevGray?.release()
+            prevGray = gray.clone()
+        } else {
+            gray.copyTo(previous)
+        }
     }
 
     /** Detects new corners, merging them into the track list. */

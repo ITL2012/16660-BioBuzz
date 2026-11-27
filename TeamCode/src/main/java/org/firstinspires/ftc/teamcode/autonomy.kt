@@ -96,11 +96,23 @@ class PhaseClock(
  */
 object ShooterModel {
 
+    private var cachedRpm = DoubleArray(0)
+    private var cachedDistances = DoubleArray(0)
+    private var cachedSamples: List<Pair<Double, Double>> = emptyList()
+
     /** Valid (rpm, distanceCm) samples, sorted by RPM ascending. */
-    private fun samples(): List<Pair<Double, Double>> =
-        SHOOTER_CALIBRATION_RPM.zip(SHOOTER_CALIBRATION_DISTANCE_CM)
-            .filter { it.second > 0.0 }
-            .sortedBy { it.first }
+    private fun samples(): List<Pair<Double, Double>> {
+        if (!SHOOTER_CALIBRATION_RPM.contentEquals(cachedRpm) ||
+            !SHOOTER_CALIBRATION_DISTANCE_CM.contentEquals(cachedDistances)
+        ) {
+            cachedRpm = SHOOTER_CALIBRATION_RPM.copyOf()
+            cachedDistances = SHOOTER_CALIBRATION_DISTANCE_CM.copyOf()
+            cachedSamples = cachedRpm.zip(cachedDistances)
+                .filter { it.second > 0.0 }
+                .sortedBy { it.first }
+        }
+        return cachedSamples
+    }
 
     /** True once at least two real calibration points exist. */
     fun isCalibrated(): Boolean = samples().size >= 2
@@ -149,11 +161,14 @@ object ShooterModel {
      */
     fun rpmForDistance(distanceCm: Double): Double {
         val s = samples()
-        if (s.size < 2) return estimatedRpmForDistance(distanceCm)
+        return if (s.size < 2) estimatedRpmForDistance(distanceCm) else interpolateCalibrated(s, distanceCm)
+    }
 
+    internal fun interpolateCalibrated(s: List<Pair<Double, Double>>, distanceCm: Double): Double {
+        require(s.size >= 2) { "at least two calibration samples are required" }
         var lo = s.first()
         var hi = s.last()
-        for (i in 0 until s.size - 2) {
+        for (i in 0 until s.size - 1) {
             if (distanceCm in s[i].second..s[i + 1].second) {
                 lo = s[i]
                 hi = s[i + 1]
@@ -195,7 +210,7 @@ object ShooterModel {
         if (isCalibrated()) {
             String.format(Locale.US, "calibrated %.0f-%.0fcm", minRangeCm(), maxRangeCm())
         } else {
-            "UNCALIBRATED (fires full speed)"
+            "UNCALIBRATED (physics estimate)"
         }
 }
 

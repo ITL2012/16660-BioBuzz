@@ -543,8 +543,8 @@ class BioBuzzTeleOp : LinearOpMode() {
             }
             if (now - lastLogNanos > (1e9 / BLACKBOX_STATE_LOG_HZ).toLong()) {
                 lastLogNanos = now
-                BlackBox.event(
-                    "teleop",
+                BlackBox.log(
+                    "record" to "teleop",
                     "fwd" to forward, "strafe" to strafe, "turn" to turn,
                     "a" to gamepad1.a, "b" to gamepad1.b,
                     "rb" to gamepad1.right_bumper, "lb" to gamepad1.left_bumper,

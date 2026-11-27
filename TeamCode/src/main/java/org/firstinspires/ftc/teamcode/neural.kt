@@ -384,12 +384,15 @@ object NeuralReferee {
  * tools/train_detector.py; copy ball_detector.tflite to the app's external
  * storage (the same place blackbox/ lives) over USB.
  */
-class DetectorProcessor(context: Context) : VisionProcessor {
+class DetectorProcessor(context: Context) : VisionProcessor, AutoCloseable {
 
     private var interpreter: Interpreter? = null
     private var inputSize = 320
     private var inputBuf: ByteBuffer? = null
     private var outputShape: IntArray = IntArray(0)
+    private var output: Array<Array<FloatArray>>? = null
+    private val resized = Mat()
+    private var rgbaBytes = ByteArray(0)
     private var lastNanos = 0L
     private var paint: Paint? = null
 
@@ -400,16 +403,22 @@ class DetectorProcessor(context: Context) : VisionProcessor {
                 if (!f.exists()) {
                     BlackBox.event("nn_status", "component" to "detector", "status" to "no model file")
                 } else {
-                    val channel = FileInputStream(f).channel
-                    val model: MappedByteBuffer =
-                        channel.map(FileChannel.MapMode.READ_ONLY, 0, f.length())
-                    interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 2 })
+                    FileInputStream(f).channel.use { channel ->
+                        val model: MappedByteBuffer =
+                            channel.map(FileChannel.MapMode.READ_ONLY, 0, f.length())
+                        interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 2 })
+                    }
                     val inShape = interpreter!!.getInputTensor(0).shape() // [1, S, S, 3]
                     inputSize = inShape[1]
                     inputBuf =
                         ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
                             .order(ByteOrder.nativeOrder())
+                    rgbaBytes = ByteArray(inputSize * inputSize * 4)
                     outputShape = interpreter!!.getOutputTensor(0).shape()
+                    require(outputShape.size == 3) { "Expected [1][channels][detections] detector output" }
+                    output = Array(outputShape[0]) {
+                        Array(outputShape[1]) { FloatArray(outputShape[2]) }
+                    }
                     BlackBox.event(
                         "nn_status", "component" to "detector",
                         "status" to "loaded", "inputSize" to inputSize,
@@ -435,47 +444,27 @@ class DetectorProcessor(context: Context) : VisionProcessor {
         if (captureTimeNanos - lastNanos < (1e9 / NN_DETECT_HZ).toLong()) return null
         lastNanos = captureTimeNanos
 
-        var resized: Mat? = null
-        var rgb: Mat? = null
         return try {
-            // 0. VisionProcessor frames are 4-channel RGBA (the SDK's own
-            //    processors use COLOR_RGBA2GRAY/RGBA2RGB). Drop alpha FIRST —
-            //    reading 3 bytes/pixel straight from an RGBA Mat yields
-            //    misaligned garbage after the first pixel.
-            val rgbMat = Mat()
-            Imgproc.cvtColor(f, rgbMat, Imgproc.COLOR_RGBA2RGB)
-            // 1. resize to the model's square input (aspect stretched back later)
-            val resizedMat = Mat()
-            Imgproc.resize(rgbMat, resizedMat, Size(inputSize.toDouble(), inputSize.toDouble()))
-            resized = resizedMat
-            rgb = rgbMat
-            // 2. pixels -> float32 NHWC buffer in [0,1], RGB order like training
-            val bytes = ByteArray(inputSize * inputSize * 3)
-            resizedMat.get(0, 0, bytes)
+            // Resize RGBA directly, then sample RGB with a four-byte stride.
+            // This avoids a full-frame color conversion and a second native Mat.
+            Imgproc.resize(f, resized, Size(inputSize.toDouble(), inputSize.toDouble()))
+            resized.get(0, 0, rgbaBytes)
             val buf = inputBuf!!
             buf.rewind()
             var i = 0
-            while (i < bytes.size) {
-                buf.putFloat((bytes[i].toInt() and 0xFF) / 255f)       // R
-                buf.putFloat((bytes[i + 1].toInt() and 0xFF) / 255f)   // G
-                buf.putFloat((bytes[i + 2].toInt() and 0xFF) / 255f)   // B
-                i += 3
+            while (i < rgbaBytes.size) {
+                buf.putFloat((rgbaBytes[i].toInt() and 0xFF) / 255f)
+                buf.putFloat((rgbaBytes[i + 1].toInt() and 0xFF) / 255f)
+                buf.putFloat((rgbaBytes[i + 2].toInt() and 0xFF) / 255f)
+                i += 4
             }
-            // 3. allocate output by the model's real shape and run
-            val out = Array(outputShape[0]) {
-                Array(outputShape[1]) { FloatArray(outputShape[2]) }
-            }
+            buf.rewind()
+            val out = output!!
             itp.run(buf, out)
-            // 4. decode + NMS + publish (boxes scaled back to full-frame coords)
             NeuralReferee.publish(decode(out, f.cols().toDouble(), f.rows().toDouble()), captureTimeNanos)
             null
         } catch (_: Exception) {
             null // inference must never stall the vision pipeline
-        } finally {
-            // OpenCV Mats are native heap — always release or the 3 Hz
-            // inference slowly leaks megabytes over a match.
-            rgb?.release()
-            resized?.release()
         }
     }
 
@@ -529,6 +518,12 @@ class DetectorProcessor(context: Context) : VisionProcessor {
                 w = it[2], h = it[3],
             )
         }
+    }
+
+    override fun close() {
+        interpreter?.close()
+        interpreter = null
+        resized.release()
     }
 
     override fun onDrawFrame(

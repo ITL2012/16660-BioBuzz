@@ -81,6 +81,25 @@ class DeadWheelMathTest {
     }
 
     @Test
+    fun `precomputed kinematics match the direct solve`() {
+        val kinematics = DeadWheelMath.Kinematics(wheels)
+        val positions = doubleArrayOf(10.2, 9.8, 3.1)
+        val velocities = doubleArrayOf(-6.0, 6.0, -1.0)
+        val headingDelta = 0.08
+
+        val expectedPosition = DeadWheelMath.positionDelta(wheels, positions.toList(), headingDelta)
+        val actualPosition = kinematics.positionDelta(positions, headingDelta)
+        assertEquals(expectedPosition.first, actualPosition.first, 1e-9)
+        assertEquals(expectedPosition.second, actualPosition.second, 1e-9)
+
+        val expectedVelocity = DeadWheelMath.velocity(wheels, velocities.toList())
+        val actualVelocity = kinematics.velocity(velocities)
+        assertEquals(expectedVelocity.first, actualVelocity.first, 1e-9)
+        assertEquals(expectedVelocity.second, actualVelocity.second, 1e-9)
+        assertEquals(expectedVelocity.third, actualVelocity.third, 1e-9)
+    }
+
+    @Test
     fun `wrapDeg wraps into the -180 to +180 range`() {
         assertEquals(-170.0, DeadWheelMath.wrapDeg(190.0), 1e-9)
         assertEquals(170.0, DeadWheelMath.wrapDeg(-190.0), 1e-9)

@@ -24,13 +24,14 @@ import kotlin.math.min
  * stale ones by timestamp. Both cameras run one of these, feeding ONE
  * [HybridPoseEstimator]; a blocked/failed camera simply stops publishing.
  */
-class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor {
+class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor, AutoCloseable {
 
     private val calibration = VisionConfig.calibrationFor(cameraId)
     private val tracker = OpticalFlowTracker(cameraId)
     private val sceneEstimator = StaticSceneEstimator()
     private val motionEstimator = VisualMotionEstimator(calibration)
     private val landmarkTracker = LandmarkTracker(cameraId)
+    private val gray = Mat()
 
     private val latest = AtomicReference<CameraObservation?>(null)
 
@@ -82,7 +83,6 @@ class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor {
         }
         lastProcessNanos = captureTimeNanos
 
-        val gray = Mat()
         Imgproc.cvtColor(img, gray, Imgproc.COLOR_RGB2GRAY)
 
         // ---- Track features ----
@@ -131,8 +131,6 @@ class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor {
             landmarks = landmarkTracker.snapshot(captureTimeNanos),
         )
         latest.set(observation)
-
-        gray.release()
         return observation
     }
 
@@ -163,6 +161,11 @@ class VisionCameraProcessor(private val cameraId: CameraId) : VisionProcessor {
         lastProcessNanos = 0L
         fpsEma = 0.0
         confidenceEma = 0.0
+    }
+
+    override fun close() {
+        reset()
+        gray.release()
     }
 
     /**

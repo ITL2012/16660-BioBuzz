@@ -201,7 +201,12 @@ class VisionTestOpMode : LinearOpMode() {
 class VisualLocalizationTest : LinearOpMode() {
 
     override fun runOpMode() {
-        val vision = VisionSubsystem(hardwareMap)
+        BlackBox.start(hardwareMap.appContext, "vision_test")
+        val vision = VisionSubsystem(
+            hardwareMap,
+            extraUpProcessors = listOf(FrameGrabProcessor("UP")),
+            extraFrontProcessors = listOf(FrameGrabProcessor("FRONT")),
+        )
 
         telemetry.addLine("Vision test initialized. Watch the camera previews:")
         telemetry.addLine("GREEN = static inlier, RED = outlier/moving,")
@@ -222,6 +227,7 @@ class VisualLocalizationTest : LinearOpMode() {
         }
 
         vision.close()
+        BlackBox.stop()
     }
 }
 

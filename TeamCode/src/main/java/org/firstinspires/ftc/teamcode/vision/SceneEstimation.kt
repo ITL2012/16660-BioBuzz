@@ -53,9 +53,7 @@ class StaticSceneEstimator {
      */
     fun estimate(prev: DoubleArray, cur: DoubleArray): Result {
         val n = prev.size / 2
-        if (n < VisionTuning.RANSAC_MIN_INLIERS) {
-            return failure()
-        }
+        if (n < VisionTuning.RANSAC_MIN_INLIERS) return failure()
 
         var bestInliers = IntArray(0)
         var bestCount = -1
@@ -63,65 +61,54 @@ class StaticSceneEstimator {
         var bestTx = 0.0
         var bestTy = 0.0
         var bestScale = 1.0
+        val candidateInliers = IntArray(n)
+        val thresholdSq = VisionTuning.RANSAC_INLIER_THRESHOLD_PX *
+            VisionTuning.RANSAC_INLIER_THRESHOLD_PX
 
-        // --- RANSAC sampling: minimal model = 2 correspondences ---
-        repeat(VisionTuning.RANSAC_ITERATIONS) { iter ->
+        for (iter in 0 until VisionTuning.RANSAC_ITERATIONS) {
             val i = pick(n, iter)
-            val j = pick(n, iter + 7919) // cheap LCG-style spacing
-            if (i == j) return@repeat
-
-            val m = try {
-                fitTwo(prev, cur, i, j)
-            } catch (e: Exception) {
-                null
-            } ?: return@repeat
+            val j = pick(n, iter + 7919)
+            if (i == j) continue
+            val m = fitTwo(prev, cur, i, j) ?: continue
 
             var count = 0
-            val inliers = IntArray(n)
             for (k in 0 until n) {
                 val px = prev[2 * k]
                 val py = prev[2 * k + 1]
-                val cx = cur[2 * k]
-                val cy = cur[2 * k + 1]
-                val mx = m.scale * (cos(m.theta) * px - sin(m.theta) * py) + m.tx
-                val my = m.scale * (sin(m.theta) * px + cos(m.theta) * py) + m.ty
-                if (hypot(cx - mx, cy - my) <= VisionTuning.RANSAC_INLIER_THRESHOLD_PX) {
-                    inliers[count] = k
+                val dx = cur[2 * k] - (m.a * px - m.b * py + m.tx)
+                val dy = cur[2 * k + 1] - (m.b * px + m.a * py + m.ty)
+                if (dx * dx + dy * dy <= thresholdSq) {
+                    candidateInliers[count] = k
                     count++
                 }
             }
 
             if (count > bestCount) {
                 bestCount = count
-                bestInliers = inliers.copyOf(count)
+                bestInliers = candidateInliers.copyOf(count)
                 bestTheta = m.theta
                 bestTx = m.tx
                 bestTy = m.ty
                 bestScale = m.scale
+                if (bestCount == n) break
             }
         }
 
-        val ratio = if (n > 0) bestCount.toDouble() / n else 0.0
+        val ratio = bestCount.toDouble() / n
         val ok = bestCount >= VisionTuning.RANSAC_MIN_INLIERS &&
             ratio >= VisionTuning.RANSAC_MIN_INLIER_RATIO &&
             abs(bestScale - 1.0) <= VisionTuning.RANSAC_MAX_SCALE_ERROR
-
         if (!ok) return failure()
 
-        // --- Refit on the inlier consensus set (least-squares similarity) ---
         val refined = refit(prev, cur, bestInliers) ?: return failure()
-
-        // Recompute inliers against the refined model for final classification
         val finalInliers = IntArray(n)
         var count = 0
         for (k in 0 until n) {
             val px = prev[2 * k]
             val py = prev[2 * k + 1]
-            val cx = cur[2 * k]
-            val cy = cur[2 * k + 1]
-            val mx = refined.scale * (cos(refined.theta) * px - sin(refined.theta) * py) + refined.tx
-            val my = refined.scale * (sin(refined.theta) * px + cos(refined.theta) * py) + refined.ty
-            if (hypot(cx - mx, cy - my) <= VisionTuning.RANSAC_INLIER_THRESHOLD_PX) {
+            val dx = cur[2 * k] - (refined.a * px - refined.b * py + refined.tx)
+            val dy = cur[2 * k + 1] - (refined.b * px + refined.a * py + refined.ty)
+            if (dx * dx + dy * dy <= thresholdSq) {
                 finalInliers[count] = k
                 count++
             }
@@ -134,7 +121,7 @@ class StaticSceneEstimator {
             tyPx = refined.ty,
             scale = refined.scale,
             inlierIndices = finalInliers.copyOf(count),
-            inlierRatio = if (n > 0) count.toDouble() / n else 0.0,
+            inlierRatio = count.toDouble() / n,
         )
     }
 
@@ -149,7 +136,14 @@ class StaticSceneEstimator {
         return ((x ushr 16) and 0x7FFFFFFF) % n
     }
 
-    private data class Model(val theta: Double, val tx: Double, val ty: Double, val scale: Double)
+    private data class Model(
+        val theta: Double,
+        val tx: Double,
+        val ty: Double,
+        val scale: Double,
+        val a: Double,
+        val b: Double,
+    )
 
     /** Exact similarity fit from 2 correspondences. Returns null on degenerate geometry. */
     private fun fitTwo(prev: DoubleArray, cur: DoubleArray, i: Int, j: Int): Model? {
@@ -169,16 +163,16 @@ class StaticSceneEstimator {
 
         val scale = kotlin.math.sqrt(dcSq / dpSq)
         val theta = atan2(
-            dcx * dpy - dcy * dpx,
-            dcx * dpx + dcy * dpy,
+            dpx * dcy - dpy * dcx,
+            dpx * dcx + dpy * dcy,
         )
         if (!theta.isFinite()) return null
 
-        val cosT = cos(theta) * scale
-        val sinT = sin(theta) * scale
-        val tx = c1x - (cosT * p1x - sinT * p1y)
-        val ty = c1y - (sinT * p1x + cosT * p1y)
-        return Model(theta, tx, ty, scale)
+        val a = cos(theta) * scale
+        val b = sin(theta) * scale
+        val tx = c1x - (a * p1x - b * p1y)
+        val ty = c1y - (b * p1x + a * p1y)
+        return Model(theta, tx, ty, scale, a, b)
     }
 
     /** Least-squares similarity refit over the consensus set (Procrustes-style). */
@@ -209,11 +203,11 @@ class StaticSceneEstimator {
 
         val scale = kotlin.math.sqrt((a * a + b * b) / (sp * sp))
         val theta = atan2(b, a)
-        val cosT = cos(theta) * scale
-        val sinT = sin(theta) * scale
-        val tx = cx - (cosT * mx - sinT * my)
-        val ty = cy - (sinT * mx + cosT * my)
-        return Model(theta, tx, ty, scale)
+        val rotScaleX = cos(theta) * scale
+        val rotScaleY = sin(theta) * scale
+        val tx = cx - (rotScaleX * mx - rotScaleY * my)
+        val ty = cy - (rotScaleY * mx + rotScaleX * my)
+        return Model(theta, tx, ty, scale, rotScaleX, rotScaleY)
     }
 
 }

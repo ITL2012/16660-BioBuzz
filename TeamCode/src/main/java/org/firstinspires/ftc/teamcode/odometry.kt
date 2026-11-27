@@ -30,6 +30,82 @@ object DeadWheelMath {
         val angleRad: Double,
     )
 
+    class Kinematics(wheels: List<WheelSpec>) {
+        private val cos = DoubleArray(wheels.size)
+        private val sin = DoubleArray(wheels.size)
+        private val rotation = DoubleArray(wheels.size)
+        private var p00 = 0.0
+        private var p01 = 0.0
+        private var p10 = 0.0
+        private var p11 = 0.0
+        private val inverse = DoubleArray(9)
+        private var velocityValid = false
+
+        init {
+            require(wheels.size == 3) { "three wheels are required" }
+            var sxx = 0.0
+            var sxy = 0.0
+            var syy = 0.0
+            for (i in wheels.indices) {
+                val w = wheels[i]
+                cos[i] = cos(w.angleRad)
+                sin[i] = sin(w.angleRad)
+                rotation[i] = w.x * sin[i] - w.y * cos[i]
+                sxx += cos[i] * cos[i]
+                sxy += cos[i] * sin[i]
+                syy += sin[i] * sin[i]
+            }
+            val positionDet = sxx * syy - sxy * sxy
+            if (abs(positionDet) >= 1e-9) {
+                p00 = syy / positionDet
+                p01 = -sxy / positionDet
+                p10 = -sxy / positionDet
+                p11 = sxx / positionDet
+            }
+
+            val a = cos
+            val b = sin
+            val c = rotation
+            val det = a[0] * (b[1] * c[2] - c[1] * b[2]) -
+                b[0] * (a[1] * c[2] - c[1] * a[2]) +
+                c[0] * (a[1] * b[2] - b[1] * a[2])
+            if (abs(det) >= 1e-9) {
+                velocityValid = true
+                inverse[0] = (b[1] * c[2] - c[1] * b[2]) / det
+                inverse[1] = (c[0] * b[2] - b[0] * c[2]) / det
+                inverse[2] = (b[0] * c[1] - c[0] * b[1]) / det
+                inverse[3] = (c[1] * a[2] - a[1] * c[2]) / det
+                inverse[4] = (a[0] * c[2] - c[0] * a[2]) / det
+                inverse[5] = (c[0] * a[1] - a[0] * c[1]) / det
+                inverse[6] = (a[1] * b[2] - b[1] * a[2]) / det
+                inverse[7] = (a[2] * b[0] - a[0] * b[2]) / det
+                inverse[8] = (a[0] * b[1] - b[0] * a[1]) / det
+            }
+        }
+
+        fun positionDelta(measuredIn: DoubleArray, headingDelta: Double): Pair<Double, Double> {
+            require(measuredIn.size == cos.size) { "wheel/measurement count mismatch" }
+            var bx = 0.0
+            var by = 0.0
+            for (i in cos.indices) {
+                val measured = measuredIn[i] - rotation[i] * headingDelta
+                bx += cos[i] * measured
+                by += sin[i] * measured
+            }
+            return (p00 * bx + p01 * by) to (p10 * bx + p11 * by)
+        }
+
+        fun velocity(measuredInPerSec: DoubleArray): Triple<Double, Double, Double> {
+            require(measuredInPerSec.size == 3) { "wheel/measurement count mismatch" }
+            if (!velocityValid) return Triple(0.0, 0.0, 0.0)
+            return Triple(
+                inverse[0] * measuredInPerSec[0] + inverse[1] * measuredInPerSec[1] + inverse[2] * measuredInPerSec[2],
+                inverse[3] * measuredInPerSec[0] + inverse[4] * measuredInPerSec[1] + inverse[5] * measuredInPerSec[2],
+                inverse[6] * measuredInPerSec[0] + inverse[7] * measuredInPerSec[1] + inverse[8] * measuredInPerSec[2],
+            )
+        }
+    }
+
     fun inchesPerTick(ticksPerRev: Double, diameterIn: Double): Double =
         Math.PI * diameterIn / ticksPerRev
 
